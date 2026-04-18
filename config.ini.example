@@ -1,0 +1,102 @@
+[DEFAULT]
+# ------------------------------------------------------------------
+# dbus-soyosource configuration
+# ------------------------------------------------------------------
+
+# Serial port to the Soyosource inverter (RS-485 at 4800 8N1).
+#
+# Prefer the stable /dev/serial/by-id/... path — it's keyed on the FTDI
+# chip's serial number, so it survives USB re-enumeration (unlike /dev/ttyUSB<N>
+# which can shift if devices are plugged/unplugged or boot in different order).
+# Find yours with:  ls -la /dev/serial/by-id/
+SerialPort = /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_XXXXXXXX-if00-port0
+
+# Physical wiring: which AC phase the Soyosource feeds into. Reported on
+# /Settings/System/AcPhase and used for the /Ac/Out/<phase>/* D-Bus paths.
+# Valid values: L1, L2, L3.
+Phase = L1
+
+# Which grid-meter reading(s) the control loop follows.
+#   L1, L2, L3 — read /Ac/Grid/<P>/Power and drive demand so that phase
+#                settles at TargetGridW.
+#   ALL        — sum /Ac/Grid/L1/Power + L2 + L3 (skipping phases the
+#                meter doesn't report). Best choice if your utility nets
+#                all three phases for billing: a single-phase inverter on
+#                L1 can then offset loads across all phases.
+TrackPhase = ALL
+
+# D-Bus device instance. Must be unique across pvinverter services.
+DeviceInstance = 41
+
+# Name shown in the Remote Console / VRM.
+CustomName = Soyosource GTN
+
+# AC connection position: 0 = AC input 1, 1 = AC output, 2 = AC input 2
+# (Currently unused — kept for forward compatibility.)
+AcPosition = 1
+
+# D-Bus service type:
+#   inverter — registers as com.victronenergy.inverter.<...>. Recommended.
+#              GUIv2's "Inverter/Charger" tile shows the state ("Inverting").
+#              The power value is visible on the detail page.
+#   vebus    — registers as com.victronenergy.vebus.<...>. NOT RECOMMENDED.
+#              GUIv2 would show power on the tile, BUT the systemcalc dvcc
+#              delegate treats us as a Multiplus and crashes when it tries to
+#              compare our FirmwareVersion (string) with VEBUS_FIRMWARE_REQUIRED
+#              (int). Testing showed this took down com.victronenergy.system
+#              entirely. Don't use unless you know what you're doing.
+ServiceType = inverter
+
+# ------------------------------------------------------------------
+# Control loop timing
+# ------------------------------------------------------------------
+
+# How often we recalculate demand from grid readings (seconds).
+UpdateIntervalSeconds = 1.0
+
+# How often we retransmit the demand frame (seconds). The original
+# Soyosource meter sends every ~500 ms.
+SendIntervalSeconds = 0.5
+
+# ------------------------------------------------------------------
+# Power limits
+# ------------------------------------------------------------------
+
+# Minimum demand when the inverter should produce anything (watts).
+# Below this we send 0W instead.
+MinPowerDemand = 0
+
+# Hard upper limit (watts). Must not exceed the inverter's rating.
+# Our test inverter is labelled 1200W — set this to your model.
+MaxPowerDemand = 900
+
+# Target reading (watts) for the tracked grid power. The control loop
+# drives demand so the tracked value converges on this number.
+#   Positive — aim to always import that many watts (safety margin).
+#   Negative — aim to always export that many watts (slight overshoot).
+#   Zero     — exact zero-net; risks brief export spikes from noise.
+# Default -10 = target 10 W export so we're never buying from the grid.
+TargetGridW = -10
+
+# Damping factor for the control loop (0.0 < Damping <= 1.0).
+# 1.0 = apply the full measured error each tick (fastest, may overshoot
+#       on inverters that take seconds to ramp).
+# 0.7 = apply 70% of the error each tick (default, stable).
+Damping = 0.3
+
+# Fixed power demand (watts) used when Mode is set to "Eco" in GUIv2.
+# In Eco mode the grid-following control loop is bypassed — we just tell the
+# inverter to produce this many watts constantly. Useful for running at a
+# fixed rate without any grid-meter dependency.
+EcoPowerDemand = 360
+
+# If the grid reading on D-Bus is older than this, the service
+# will force 0W output for safety.
+GridStaleTimeoutSeconds = 10
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+
+# CRITICAL, ERROR, WARNING, INFO, DEBUG
+Logging = INFO
