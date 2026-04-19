@@ -36,16 +36,26 @@ CustomName = Soyosource GTN
 AcPosition = 1
 
 # D-Bus service type:
-#   inverter — registers as com.victronenergy.inverter.<...>. Recommended.
-#              GUIv2's "Inverter/Charger" tile shows the state ("Inverting").
-#              The power value is visible on the detail page.
-#   vebus    — registers as com.victronenergy.vebus.<...>. NOT RECOMMENDED.
-#              GUIv2 would show power on the tile, BUT the systemcalc dvcc
-#              delegate treats us as a Multiplus and crashes when it tries to
-#              compare our FirmwareVersion (string) with VEBUS_FIRMWARE_REQUIRED
-#              (int). Testing showed this took down com.victronenergy.system
-#              entirely. Don't use unless you know what you're doing.
-ServiceType = inverter
+#   vebus      — registers as com.victronenergy.vebus.<...>. Multi emulation.
+#                BEST for systems WITHOUT a real Multiplus: gives correct
+#                Total-Consumption accounting AND the native GUIv2 "Inverter
+#                / Charger" tile showing "Inverting" AND no Solar-yield
+#                mis-labelling. Works by publishing /Ac/ActiveIn/<L>/P as
+#                negative (pushing back to grid, ESS-style). We ship defensive
+#                no-op stubs for /Hub4/* so ESS (if enabled) doesn't error.
+#                DO NOT use if you also have a real Multiplus — we'd fight it
+#                for the /VebusService election.
+#   pvinverter — registers as com.victronenergy.pvinverter.<...> at Position=0
+#                (grid bus). Correct Total-Consumption accounting but shows up
+#                under "PV"/"Solar" aggregation on the dashboard (cosmetic —
+#                we're battery-sourced, but the tile aggregates us as solar).
+#                Safer choice if you have other Multi-ish devices and don't
+#                want our fake vebus to interact with them.
+#   inverter   — registers as com.victronenergy.inverter.<...>. Gets the
+#                GUIv2 Mode switch on the device page, but our /Ac/Out/L1/P
+#                is double-counted as "Essential Loads" in Total Consumption.
+#                Kept for compatibility; not recommended.
+ServiceType = vebus
 
 # ------------------------------------------------------------------
 # Control loop timing

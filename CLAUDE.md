@@ -29,11 +29,27 @@ VenusOS D-Bus (grid meter readings)
 
 The service has two roles:
 1. **Virtual Meter** — Send power demand frames to the Soyosource inverter over RS-485
-2. **Inverter on D-Bus** — Publish the Soyosource as `com.victronenergy.inverter.soyosource_<N>`
-   so it appears in the GUIv2 "Inverter/Charger" tile (and in VRM). We use the
-   `inverter` service type, not `pvinverter`, because the Soyosource is a
-   battery → AC grid-tie inverter (not solar). This was the main reason it was
-   showing up as "Essential Loads" in early testing — wrong service type.
+2. **Inverter on D-Bus** — Publish the Soyosource as `com.victronenergy.vebus.soyosource_<N>`
+   (Multi emulation, default). Topologically a Soyosource in grid-feedback mode
+   behaves identically to a Multiplus in ESS grid-export mode: DC → inverter →
+   out the AC-input terminal → onto the grid bus. By publishing
+   `/Ac/ActiveIn/L1/P = -last_demand` (negative = pushing OUT) and
+   `/Ac/Out/<L>/P = 0` (no essential-loads bus), systemcalc's
+   `ConsumptionOnInput[Lx] = Grid[Lx] − ActiveIn[Lx]` computation produces the
+   correct L1 load. This also lights up the native "Inverter / Charger" tile
+   with state "Inverting" and keeps our production OUT of "Solar yield"
+   (which was the cost of the previous pvinverter attempt). The landmine
+   mitigations required to make vebus safe are documented in the gotchas
+   below — specifically `/FirmwareVersion` as int, `/Hub4/*` no-op stubs,
+   `/Bms/AllowTo{Charge,Discharge} = None`, and `ProductId = 0xA144`.
+
+   Two alternative `ServiceType` values remain supported:
+   - `pvinverter` — same accounting math via `Position=0` aggregation, but
+     the dashboard shows us under "Solar yield". Use this if a real Multiplus
+     is also present (we'd collide on `/VebusService` otherwise).
+   - `inverter` — legacy; double-counts our output as "Essential Loads" in
+     Total Consumption. Keep the option in the switch for forward
+     compatibility / debugging, but don't recommend it.
 
 ## Soyosource RS-485 Protocol
 
@@ -97,7 +113,10 @@ Modules:
   Validated against frames captured from the OEM power meter.
 - `dbus-soyosource.py` — main service: poll grid power from D-Bus, calculate
   demand, send frames over RS-485, publish as
-  `com.victronenergy.inverter.soyosource_<N>`.
+  `com.victronenergy.pvinverter.soyosource_<N>` at Position=0 (default).
+  Supports three service types via `ServiceType` config: `pvinverter`
+  (recommended — correct accounting), `inverter` (Mode dialog in GUIv2 but
+  Essential-Loads double-count), `vebus` (landmines — see gotchas).
 - `config.ini` — single source of truth for all runtime values (serial port,
   physical + tracked phase, control-loop tuning, Eco target, safety
   timeouts). Gitignored; users copy from `config.ini.example`.
@@ -164,6 +183,34 @@ would overshoot dramatically once the new reading arrived. By skipping
 recalculation on stale-looking ticks (and treating small float jitter as stale)
 the loop stays stable.
 
+### Diagnostics (heartbeat + drift detector)
+
+Demand-change log lines alone don't show the steady-state wedge pattern we've
+hit (inverter silently stops producing while we still command max). Two extra
+streams cover that gap:
+
+- **Heartbeat** — every 60 s of wall-clock, one INFO line:
+  `heartbeat: mode=On demand=335W grid=-27.9W grid_age=0.0s tx=119/60s`
+  `tx=N/60s` is the number of successful RS-485 writes in the window (expected
+  ≈ 120 at SendIntervalSeconds=0.5s). A collapsing tx rate is the first
+  signal of a port-side issue. `grid_age` is wall-clock since the last
+  fresh D-Bus grid read.
+- **Drift detector** — when `last_demand ≥ 100 W` but `grid ≥ target + 300 W`
+  for 30 consecutive update ticks (≈ 30 s), one WARNING line. Cleared with
+  an INFO line when grid drops below `target + 100 W` (hysteresis — the
+  clear band is tighter than the warn band, so a fluctuating grid near the
+  boundary doesn't flap the warning on and off). Inside the 100–300 W
+  deadband the state is kept as-is, no log.  No auto-recovery action yet —
+  this is pure observation, so we can characterise wedges without the log
+  flushing itself. The 300 W tolerance is wide on purpose: household load
+  spikes routinely push grid 100–200 W above target even when the inverter
+  is fine.
+
+When the inverter wedges and you need to investigate, the heartbeat sequence
+around the transition + the DRIFT warning timestamp together pin down whether
+the issue is "our frames stopped going out" (tx count drops) vs. "frames go
+out, inverter ignores them" (tx count steady, grid stays high).
+
 ### Gotchas hit during development
 
 - **VenusOS serial scanners must be told we own the port — via `lock_tty`.**
@@ -189,8 +236,29 @@ the loop stays stable.
 - **PropertiesChanged signals on systemcalc paths are unreliable** across
   VenusOS versions. Polling is safer and the cost is trivial.
 - **2022 Soyosource purple mainboards don't answer status queries.** The
-  service handles the missing telemetry gracefully (Dc/* and Temperature stay
-  empty on D-Bus).
+  service handles the missing telemetry gracefully — `/Temperature` stays
+  empty; `/Dc/0/{Voltage,Current,Power}` are *estimated* (see next gotcha).
+
+- **Missing `/Dc/0/*` on vebus/inverter services inflates "DC Loads" in Total
+  Consumption.** systemcalc computes `vebuspower = V * I` per vebus service
+  (and `inverter_power += V_dc * I_dc` for non-vebus `inverter` services),
+  then folds both into `/Dc/System/Power` via:
+  `DcSystemPower = solar + charger + fuelcell + alt + vebus + inverter - battery`
+  (sign convention: positive = DC loads consuming power; battery positive =
+  charging; vebus/inverter positive = flowing INTO the DC bus, i.e. charging).
+  When we're inverting and publish no `/Dc/0/*`, our `vebuspower` (or
+  `inverter_power`) contribution is 0, so the battery's discharge gets
+  attributed entirely to "DC Loads" — which then lands in Total Consumption
+  *on top of* AC Loads, double-counting our output. Symptom on VRM: Total
+  Consumption ≈ AC Loads + our commanded demand.
+  Fix: always publish `/Dc/0/Voltage` (read from
+  `com.victronenergy.system /Dc/Battery/Voltage`, fallback 52 V nominal if
+  no battery monitor) and `/Dc/0/Current = -demand / (V × efficiency)` —
+  negative because current flows OUT of the DC bus into our inverter.
+  Efficiency baked in as `INVERTER_EFFICIENCY = 0.94` (Soyosource datasheet
+  ~93–95%). If the inverter *does* answer status queries, we prefer the real
+  V/I it reports, negating the current magnitude since the Soyosource reports
+  unsigned while systemcalc expects signed.
 - **Raspberry Pi 2 power supply**: under-voltage warnings in `dmesg` cause
   intermittent USB disconnects. Unrelated to the service but worth tracking.
 - **D-Bus NameExistsException on quick restart**: when daemontools restarts the
@@ -210,23 +278,90 @@ the loop stays stable.
   (see below) — without the flag, even after systemcalc recovered we couldn't
   read grid power until the service restarted.
 
-- **GUIv2 Inverter/Charger tile shows state, not power, for `inverter` service
-  type.** That tile is purpose-built for Multiplus/Quattro (`com.victronenergy.
-  vebus`). For our simpler battery→AC inverter, the tile correctly identifies
-  the state ("Inverting") but the wattage is only on the detail page. The
-  power *is* aggregated by systemcalc (`Dc/InverterCharger/Power`) and visible
-  in the Battery tile (-Wh discharge) and on the device list page.
+- **`inverter` service type double-counts as Essential Loads.** systemcalc
+  treats `/Ac/Out/<L>/P` on an `inverter` service as "loads on the inverter's
+  AC-output bus" and adds it to `ConsumptionOnOutput[Lx]`. That's correct for
+  a Multiplus (which has a physically distinct AC-Out terminal with its own
+  loads), wrong for us (our "AC Out" is the same grid bus the meter sits on,
+  so household loads on L1 are already in the grid reading). Result: VRM
+  "Total Consumption" = AC Loads + Essential Loads, where Essential Loads
+  equals our commanded demand — inflating the number by the full inverter
+  output. With the correct L1 load being `Grid[L1] + our_output` (e.g.
+  `-147 + 343 = 196 W`), switching to `pvinverter` at `Position=0` gets the
+  math right: our output is subtracted from grid in `ConsumptionOnInput[Lx]`
+  instead of added to `ConsumptionOnOutput`. This is how AC-coupled Fronius
+  setups work and what the ESPHome Soyosource integration uses.
 
-- **Don't register as `vebus` to get power on the tile.** Tested and reverted:
-  `dbus-systemcalc-py/delegates/dvcc.py` finds the vebus service, treats it as
-  a Multi, and crashes with `TypeError: '<' not supported between instances of
-  'str' and 'int'` while comparing our `/FirmwareVersion='unknown'` (string) to
-  `VEBUS_FIRMWARE_REQUIRED` (int). The crashloop in systemcalc takes
-  `com.victronenergy.system` off the bus entirely — every other service that
-  reads from it then fails. A numeric `/FirmwareVersion` would clear that
-  specific check, but `vebus` triggers many more code paths that assume a real
-  Multi (BMS handshake, DVCC charge control, ESS hub-4, etc.) — every one is a
-  potential landmine. Stick with `inverter`.
+- **`pvinverter` aggregation silently skips if `/Settings/SystemSetup/AcInput1`
+  is missing.** systemcalc's `PvInverters.map_position()` (in
+  `/opt/victronenergy/dbus-systemcalc-py/delegates/pvinverter.py`) maps our
+  `Position=0` to `/Ac/PvOnGrid` *only if* localsettings has
+  `/Settings/SystemSetup/AcInput1 ∈ {1=Grid, 2=Genset, 3=Shore}`. On systems
+  that never had a Multiplus (like a Pi2 running a bare-minimum VenusOS),
+  that setting never gets created — so `map_position()` returns `None`, our
+  production isn't aggregated anywhere, and `ConsumptionOnInput[L1]` stays
+  clamped to `max(0, Grid[L1])` (i.e. zero when exporting). Symptom:
+  `/Ac/PvOnGrid/L1/Power = []` (dbus empty array) even though our service is
+  discoverable and publishing `/Ac/L1/Power` correctly.
+  Fix: `ensure_acinput1_is_grid()` runs at pvinverter-service startup and
+  uses `com.victronenergy.Settings.AddSetting('SystemSetup', 'AcInput1', 1,
+  'i', 0, 0)` — idempotent, so safe on systems where a real Multiplus
+  previously set it to something else.
+
+- **GUIv2 renders no Mode dialog for `pvinverter` services.** The On/Eco/Off
+  switch is only on the Multi/Inverter device pages. With `pvinverter`, our
+  writable `/Mode` path still accepts values — but from D-Bus / MQTT /
+  Node-RED, not the native UI. Trade-off we accept for correct accounting.
+  If the user wants the dialog back, switch `ServiceType = inverter` (cost:
+  wrong consumption math) or add a second parallel `inverter` service with
+  `/Ac/Out/<L>/P = 0` purely for the UI (hybrid approach — avoided in the
+  single-service implementation for simplicity).
+
+- **`vebus` is now the default, after taming the landmines.** First attempt
+  crashed systemcalc because `dvcc.py` compared our `/FirmwareVersion='unknown'`
+  (string) to `VEBUS_FIRMWARE_REQUIRED` (int) — `TypeError`, systemcalc
+  crashloops, `com.victronenergy.system` drops off the bus and every dependent
+  service starts failing. Second attempt (now live) addresses this and the
+  adjacent assumptions:
+  - `/FirmwareVersion = 469` (int, passes the dvcc compare).
+  - `/Bms/AllowToCharge = /Bms/AllowToDischarge = None` — systemcalc's BMS
+    delegate reads `None` and interprets "no vebus BMS", defers to the
+    real battery service (JKBMS on SerialBattery). Avoids the BMS handshake
+    dance with a Multi product ID.
+  - `ProductId = 0xA144` (ours, not a known Multiplus ID) — nothing in
+    Victron's BMS-integration product table matches, so the BMS
+    integration-specific code stays dormant.
+  - `/Hub4/L1..L3/AcPowerSetpoint`, `/Hub4/DisableCharge`, `/Hub4/DisableFeedIn`,
+    `/Hub4/Sustain`, `/Hub4/DoNotFeedInOvervoltage`,
+    `/Hub4/BatteryOvervoltageProtectionActivated` exposed as writable no-op
+    stubs so ESS (`Hub4Mode=1` / BatteryLife) can write grid setpoints without
+    errors. We log writes at DEBUG and otherwise ignore them — our own grid
+    follower remains authoritative, and ESS's setpoint would converge to
+    roughly the same value anyway on a no-Multi system.
+  - `/Hub4/AssistantId = None` — systemcalc's SystemState delegate treats us
+    as "no ESS assistant", avoiding the ExternalControl branch that expects
+    Hub4Mode=3 coordination.
+  - `/Ac/ActiveIn/ActiveInput = 0` (Input 1 live) instead of 240 (disconnected),
+    because we want ConsumptionOnInput[L1] to be computed as
+    `Grid[L1] - ActiveIn[L1]`. We publish `ActiveIn[L1] = -last_demand`
+    (negative = pushing OUT of the AC input terminal, ESS-feedback style),
+    which makes the subtraction work out to `Grid[L1] + demand` — the
+    correct L1 load.
+  - `/Ac/Out/<L>/P = 0` always — no essential-loads bus exists on our
+    topology, and publishing nonzero here would double-count into
+    `ConsumptionOnOutput[Lx]`.
+
+  Verified live: systemcalc stays up, `/VebusService` elects us, `/Ac/PvOnGrid
+  = []` (no Solar-yield pollution), `/Ac/ConsumptionOnInput[L1]` correctly
+  reflects `Grid + production`, `/SystemState/State = 9` (Inverter/Charger
+  tile reads "Inverting"). `/Dc/Vebus/Power = []` because our 2022 Soyosource
+  doesn't answer status queries — doesn't hurt accounting, just leaves the
+  DC-side of the Battery tile unfilled.
+
+  Do NOT enable `vebus` alongside a real Multiplus on the same system —
+  systemcalc elects `/VebusService` by lowest device instance, and behaviour
+  becomes undefined if two vebus services compete. For that case, use
+  `ServiceType = pvinverter`.
 
 - **Stale device entries in GUIv2 after switching service type**: each
   `<service_type>.<custom>_<instance>` registration leaves a "remembered" entry

@@ -43,6 +43,20 @@ VALID_MODES = (MODE_ON, MODE_OFF, MODE_ECO)
 
 _MODE_NAMES = {MODE_ON: 'On', MODE_OFF: 'Off', MODE_ECO: 'Eco'}
 
+# Soyosource DC→AC conversion efficiency. Datasheets quote ~93–95% under load.
+# Used to estimate /Dc/0/Current when the inverter doesn't answer status queries
+# (2022 purple-board mainboards are silent). Without this estimate, systemcalc
+# has no idea we're pulling power from the DC bus and mis-attributes the whole
+# battery discharge to "DC Loads", inflating Total Consumption.
+INVERTER_EFFICIENCY = 0.94
+
+# Fallback battery voltage when /Dc/Battery/Voltage isn't published on
+# com.victronenergy.system (e.g. no battery monitor configured). Typical for a
+# 48V LFP pack at rest. Only used to keep the DC estimate non-zero; if the real
+# voltage is wildly different, Total-Consumption accounting will still be close
+# enough and the drift is bounded by the efficiency factor anyway.
+FALLBACK_BATTERY_VOLTAGE = 52.0
+
 
 def _mode_name(mode):
     return _MODE_NAMES.get(mode, 'Mode(%d)' % mode)
@@ -72,17 +86,22 @@ class Config:
         self.custom_name = s.get('CustomName', 'Soyosource GTN')
         self.ac_position = int(s.get('AcPosition', '1'))
 
-        # D-Bus service type. Two viable options for a Soyosource:
-        #   "vebus"    — registers as com.victronenergy.vebus.<...>. GUIv2's
-        #                "Inverter/Charger" tile shows both state AND power.
-        #                This is what Multiplus/Quattro use. Some VenusOS code
-        #                (ESS/Hub) is gated on vebus presence; for a system
-        #                that already had no Multiplus this is fine.
-        #   "inverter" — registers as com.victronenergy.inverter.<...>. GUIv2
-        #                tile shows state ("Inverting") only, no power value.
-        #                Semantically cleaner if you don't want any vebus
-        #                side-effects.
-        self.service_type = s.get('ServiceType', 'vebus').strip().lower()
+        # D-Bus service type. Three options for a Soyosource:
+        #   "pvinverter" — registers as com.victronenergy.pvinverter.<...> at
+        #                  Position=0 (grid bus). Correct Total-Consumption
+        #                  accounting: our output subtracts from grid import
+        #                  in ConsumptionOnInput, no double-count. Default and
+        #                  recommended. Labelled as "PV" on the dashboard
+        #                  (cosmetic — we're battery-sourced).
+        #   "inverter"   — registers as com.victronenergy.inverter.<...>.
+        #                  GUIv2 shows the Mode switch (On/Eco/Off) on the
+        #                  device page, but our output gets counted as
+        #                  "Essential Loads", double-counting Total Consumption.
+        #   "vebus"      — registers as com.victronenergy.vebus.<...>. Would
+        #                  give both correct accounting AND the Mode switch,
+        #                  but triggers DVCC/ESS/BMS delegates that assume a
+        #                  real Multiplus and crash. See CLAUDE.md.
+        self.service_type = s.get('ServiceType', 'pvinverter').strip().lower()
 
         self.update_interval_s = float(s.get('UpdateIntervalSeconds', '1.0'))
         self.send_interval_s = float(s.get('SendIntervalSeconds', '0.5'))
@@ -465,7 +484,7 @@ def _register_with_retry(svc, service_name):
 PHASE_TO_INT = {'L1': 0, 'L2': 1, 'L3': 2}
 
 
-def _add_management_paths(svc, cfg, version_suffix=''):
+def _add_management_paths(svc, cfg, version_suffix='', firmware_version='unknown'):
     svc.add_path('/Mgmt/ProcessName', __file__)
     svc.add_path('/Mgmt/ProcessVersion',
                  'dbus-soyosource 0.1%s on Python %s' % (version_suffix, platform.python_version()))
@@ -474,7 +493,11 @@ def _add_management_paths(svc, cfg, version_suffix=''):
     svc.add_path('/ProductId', 0xA144)
     svc.add_path('/ProductName', 'Soyosource GTN')
     svc.add_path('/CustomName', cfg.custom_name, writeable=True)
-    svc.add_path('/FirmwareVersion', 'unknown')
+    # vebus needs int here (systemcalc's dvcc delegate compares against
+    # VEBUS_FIRMWARE_REQUIRED, a string 'unknown' < int raises TypeError and
+    # crashes systemcalc). For pvinverter/inverter service types the default
+    # string is fine.
+    svc.add_path('/FirmwareVersion', firmware_version)
     svc.add_path('/HardwareVersion', 'unknown')
     svc.add_path('/Serial', 'soyosource-%d' % cfg.device_instance)
     svc.add_path('/Connected', 1)
@@ -497,38 +520,66 @@ def _add_mode_path(svc, mode_callback):
 
 def create_vebus_service(bus, cfg, mode_callback):
     """
-    Register as com.victronenergy.vebus.<...> so GUIv2 displays the power
-    value (not just the state) in the Inverter/Charger tile.
+    Register as com.victronenergy.vebus.<...> — "Multi emulation".
 
-    A Soyosource doesn't have a real AC input — it's a one-terminal grid-tie
-    inverter — so we publish /Ac/ActiveIn/* as zeros. Loads on the AC output
-    bus (which is the household grid in our case) get reported as
-    "Essential Loads" by systemcalc; that's a known consequence of pretending
-    to be a vebus device.
+    Why: it's the only service type that simultaneously gives correct
+    Total-Consumption math (via /Ac/ActiveIn/<L>/P, which systemcalc subtracts
+    from ConsumptionOnInput) AND the GUIv2 Inverter/Charger tile with a native
+    Mode dialog AND avoids the "Solar yield" mis-labelling of pvinverter.
+
+    How it works: we claim the Soyosource is feeding power OUT our AC-input
+    terminal (negative /Ac/ActiveIn/L1/P), i.e. acting exactly like a
+    Multiplus in ESS grid-feedback mode. /Ac/Out/<L>/P stays 0 because our
+    "inverter output" is the same wire as our "inverter input" — no separate
+    essential-loads bus exists.
+
+    Landmine mitigations:
+    - /FirmwareVersion published as int (469) — satisfies the dvcc delegate's
+      VEBUS_FIRMWARE_REQUIRED comparison that crashed us last time.
+    - /Hub4/* paths exposed as writable no-ops so ESS (hub-4) doesn't error
+      when it tries to write grid setpoints to our non-existent Multi.
+    - /Bms/AllowTo{Charge,Discharge} = None → BMS delegate treats us as
+      "no vebus BMS", defers to the real BMS on the battery service.
+    - ProductId kept at 0xA144 (our own) — doesn't match the Multi-BMS
+      integration table.
     """
+    ensure_acinput1_is_grid(bus)
+
     service_name = 'com.victronenergy.vebus.soyosource_%d' % cfg.device_instance
     svc = VeDbusService(service_name, bus=bus, register=False)
 
-    _add_management_paths(svc, cfg, ' (vebus)')
+    _add_management_paths(svc, cfg, ' (vebus)', firmware_version=469)
 
     _add_mode_path(svc, mode_callback)
-    # State: 0=off, 1=low power, 2=fault, 3=bulk, 4=absorption, 5=float,
-    #        6=storage, 7=equalize, 8=passthru, 9=inverting, 10=power assist,
-    #        11=power supply.
-    svc.add_path('/State', 0)
 
-    # Active AC input: 0/1 = AC input 1/2, 240 = disconnected. We have no real
-    # AC input; 240 keeps systemcalc from showing imaginary grid passthrough.
-    svc.add_path('/Ac/ActiveIn/ActiveInput', 240)
+    # State: 0=off, 9=inverting. Mirrored on VebusMainState (same values).
+    svc.add_path('/State', 0)
+    svc.add_path('/VebusMainState', 0)
+    svc.add_path('/VebusChargeState', 0)    # we never charge
+    svc.add_path('/IsInverterCharger', 1)
+
+    # AC Input: 0 = Input 1 live (grid). The _publish loop writes per-phase
+    # power as -last_demand on our wired phase — negative = pushing OUT of
+    # the AC-input terminal back to grid. systemcalc computes
+    # ConsumptionOnInput[Lx] = Grid[Lx] - ActiveIn[Lx], so a negative
+    # ActiveIn increases ConsumptionOnInput by our production (exactly the
+    # value that was hiding when grid went negative under pvinverter).
+    svc.add_path('/Ac/ActiveIn/ActiveInput', 0)
+    svc.add_path('/Ac/NumberOfAcInputs', 1)
 
     for p in ('L1', 'L2', 'L3'):
         on_phase = (p == cfg.phase)
-        # AC input — always 0 (no real input)
-        svc.add_path('/Ac/ActiveIn/%s/P' % p, 0.0,
+        # AC Input — populated on our wired phase, zero on the others (we
+        # don't see those phases at the adapter).
+        svc.add_path('/Ac/ActiveIn/%s/P' % p, 0.0 if on_phase else None,
                      gettextcallback=lambda p, v: '%.0fW' % v)
-        svc.add_path('/Ac/ActiveIn/%s/I' % p, 0.0,
+        svc.add_path('/Ac/ActiveIn/%s/I' % p, 0.0 if on_phase else None,
                      gettextcallback=lambda p, v: '%.2fA' % v)
-        # AC output — populated only on the configured phase
+        svc.add_path('/Ac/ActiveIn/%s/V' % p, 230.0 if on_phase else None,
+                     gettextcallback=lambda p, v: '%.0fV' % v)
+        svc.add_path('/Ac/ActiveIn/%s/F' % p, 50.0 if on_phase else None,
+                     gettextcallback=lambda p, v: '%.1fHz' % v)
+        # AC Output — always 0 on all phases. No essential-loads bus exists.
         svc.add_path('/Ac/Out/%s/P' % p, 0.0 if on_phase else None,
                      gettextcallback=lambda p, v: '%.0fW' % v)
         svc.add_path('/Ac/Out/%s/V' % p, 230.0 if on_phase else None,
@@ -538,23 +589,61 @@ def create_vebus_service(bus, cfg, mode_callback):
         svc.add_path('/Ac/Out/%s/F' % p, 50.0 if on_phase else None,
                      gettextcallback=lambda p, v: '%.1fHz' % v)
 
-    # DC side. Empty until the inverter answers status queries
-    # (most Soyosource mainboards don't).
+    # DC side (only populated if the inverter answers status queries).
     svc.add_path('/Dc/0/Voltage', None, gettextcallback=lambda p, v: '%.1fV' % v)
     svc.add_path('/Dc/0/Current', None, gettextcallback=lambda p, v: '%.1fA' % v)
     svc.add_path('/Dc/0/Power', None, gettextcallback=lambda p, v: '%.0fW' % v)
     svc.add_path('/Soc', None, gettextcallback=lambda p, v: '%.0f%%' % v)
 
-    # Energy
+    # Energy counters.
+    svc.add_path('/Energy/InverterToAcIn1', 0.0,
+                 gettextcallback=lambda p, v: '%.2fkWh' % v)
+    svc.add_path('/Energy/AcIn1ToInverter', 0.0,
+                 gettextcallback=lambda p, v: '%.2fkWh' % v)
     svc.add_path('/Energy/InverterToAcOut', 0.0,
                  gettextcallback=lambda p, v: '%.2fkWh' % v)
     svc.add_path('/Energy/AcOutToInverter', 0.0,
                  gettextcallback=lambda p, v: '%.2fkWh' % v)
 
-    # Optional telemetry
     svc.add_path('/Temperature', None, gettextcallback=lambda p, v: '%.1fC' % v)
 
+    # BMS stubs: None → systemcalc decides "no vebus BMS, defer to battery".
+    svc.add_path('/Bms/AllowToCharge', None)
+    svc.add_path('/Bms/AllowToDischarge', None)
+
+    # Alarms: all zero.
+    for a in ('LowVoltage', 'HighVoltage', 'LowTemperature', 'HighTemperature',
+              'Overload', 'Ripple', 'LowVoltageAcOut', 'HighVoltageAcOut'):
+        svc.add_path('/Alarms/%s' % a, 0)
+
+    _add_hub4_stubs(svc)
+
     return _register_with_retry(svc, service_name)
+
+
+def _add_hub4_stubs(svc):
+    """
+    Expose /Hub4/* as writable no-ops so ESS (hub-4 grid-setpoint mode) can
+    write to them without errors. Our control loop ignores the setpoints —
+    we drive demand from the grid meter directly. ESS's only effect is
+    noise in the log if we want to inspect it.
+
+    If the user ever enables a real Multi + ESS, they'd switch us back to
+    pvinverter first (see CLAUDE.md).
+    """
+    def accept(path, value):
+        log.debug("Hub4 write to %s = %r (ignored)", path, value)
+        return True
+    for path in ('/Hub4/L1/AcPowerSetpoint', '/Hub4/L2/AcPowerSetpoint',
+                 '/Hub4/L3/AcPowerSetpoint', '/Hub4/DisableCharge',
+                 '/Hub4/DisableFeedIn', '/Hub4/Sustain',
+                 '/Hub4/DoNotFeedInOvervoltage',
+                 '/Hub4/BatteryOvervoltageProtectionActivated'):
+        svc.add_path(path, 0, writeable=True,
+                     onchangecallback=lambda p, v: accept(p, v))
+    # /Hub4/AssistantId: None → systemcalc's SystemState treats us as "no ESS
+    # assistant installed on this Multi", avoids the ExternalControl branch.
+    svc.add_path('/Hub4/AssistantId', None)
 
 
 def create_inverter_service(bus, cfg, mode_callback):
@@ -598,14 +687,103 @@ def create_inverter_service(bus, cfg, mode_callback):
     return _register_with_retry(svc, service_name)
 
 
+def ensure_acinput1_is_grid(bus):
+    """
+    systemcalc's pvinverter delegate maps Position=0 to either /Ac/PvOnGrid or
+    /Ac/PvOnGenset by looking up /Settings/SystemSetup/AcInput1 in
+    localsettings (1=Grid, 2=Genset, 3=Shore). On systems that never had a
+    Multiplus, that setting doesn't exist — so the mapping returns None and
+    our production is silently skipped from all consumption aggregation.
+
+    We create the setting on first startup (idempotent — AddSetting is a
+    no-op if the path already exists). Value 1 = Grid, which is correct for
+    the vast majority of Soyosource installations.
+    """
+    try:
+        settings = bus.get_object('com.victronenergy.settings', '/Settings',
+                                  follow_name_owner_changes=True)
+        # AddSetting(group, name, default_value, itemType, minimum, maximum)
+        # Returns 0 on success (path created or already existed).
+        ret = settings.AddSetting(
+            'SystemSetup', 'AcInput1', dbus.Int32(1), 'i',
+            dbus.Int32(0), dbus.Int32(0),
+            dbus_interface='com.victronenergy.Settings')
+        log.info("Ensured /Settings/SystemSetup/AcInput1 exists (ret=%s) — "
+                 "required for pvinverter Position=0 aggregation", ret)
+    except dbus.DBusException as e:
+        log.warning("Could not ensure /Settings/SystemSetup/AcInput1 exists: %s — "
+                    "if Total Consumption on VRM is missing L1 load, create it "
+                    "manually with value 1 (Grid).", e)
+
+
+def create_pvinverter_service(bus, cfg, mode_callback):
+    """
+    Register as com.victronenergy.pvinverter.<...> at Position=0 (AC input 1 /
+    grid bus). This is the correct service type for our topology: the
+    Soyosource's output feeds back onto the same AC bus the grid meter sits
+    on — exactly what a Fronius/Enphase AC-coupled solar inverter does, except
+    our DC source is a battery rather than panels.
+
+    Why not `inverter`: that type assumes a separate AC-output loads bus (like
+    a Multiplus's AC-Out terminal). systemcalc then double-counts our output
+    as "Essential Loads" in Total Consumption — wrong for a grid-tie inverter.
+
+    Why not `vebus`: correct semantics, but triggers DVCC/ESS/BMS delegates
+    that assume a real Multiplus and crash on the differences. See CLAUDE.md.
+
+    Trade-off: Soyosource shows up under "PV"/"Solar" aggregations on the
+    dashboard despite being battery-sourced. Cosmetic; the accounting is
+    right. Our `/Mode` path stays writable for On/Eco/Off control via D-Bus /
+    MQTT / Node-RED (GUIv2 doesn't render a mode switch on pvinverter tiles).
+    """
+    ensure_acinput1_is_grid(bus)
+
+    service_name = 'com.victronenergy.pvinverter.soyosource_%d' % cfg.device_instance
+    svc = VeDbusService(service_name, bus=bus, register=False)
+
+    _add_management_paths(svc, cfg, ' (pvinverter)')
+
+    # Position: 0 = AC input 1 (grid bus). systemcalc uses this to decide
+    # which ConsumptionOnInput[Lx] to credit our production into.
+    svc.add_path('/Position', 0)
+
+    _add_mode_path(svc, mode_callback)
+
+    # StatusCode follows Fronius convention: 7 = Running, 8 = Standby.
+    svc.add_path('/StatusCode', 8)
+    svc.add_path('/ErrorCode', 0)
+
+    # Total and per-phase production.
+    svc.add_path('/Ac/Power', 0.0, gettextcallback=lambda p, v: '%.0fW' % v)
+    svc.add_path('/Ac/MaxPower', cfg.max_power_demand,
+                 gettextcallback=lambda p, v: '%.0fW' % v)
+    svc.add_path('/Ac/Energy/Forward', 0.0,
+                 gettextcallback=lambda p, v: '%.2fkWh' % v)
+
+    for p in ('L1', 'L2', 'L3'):
+        on_phase = (p == cfg.phase)
+        svc.add_path('/Ac/%s/Power' % p, 0.0 if on_phase else None,
+                     gettextcallback=lambda p, v: '%.0fW' % v)
+        svc.add_path('/Ac/%s/Voltage' % p, 230.0 if on_phase else None,
+                     gettextcallback=lambda p, v: '%.0fV' % v)
+        svc.add_path('/Ac/%s/Current' % p, 0.0 if on_phase else None,
+                     gettextcallback=lambda p, v: '%.2fA' % v)
+        svc.add_path('/Ac/%s/Energy/Forward' % p, 0.0 if on_phase else None,
+                     gettextcallback=lambda p, v: '%.2fkWh' % v)
+
+    return _register_with_retry(svc, service_name)
+
+
 def create_service(bus, cfg, mode_callback):
-    if cfg.service_type == 'vebus':
+    t = cfg.service_type
+    if t == 'pvinverter':
+        return create_pvinverter_service(bus, cfg, mode_callback)
+    if t == 'vebus':
         return create_vebus_service(bus, cfg, mode_callback)
-    elif cfg.service_type == 'inverter':
+    if t == 'inverter':
         return create_inverter_service(bus, cfg, mode_callback)
-    else:
-        log.warning("Unknown ServiceType %r — defaulting to inverter", cfg.service_type)
-        return create_inverter_service(bus, cfg, mode_callback)
+    log.warning("Unknown ServiceType %r — defaulting to pvinverter", t)
+    return create_pvinverter_service(bus, cfg, mode_callback)
 
 
 # -----------------------------------------------------------------------------
@@ -631,6 +809,20 @@ class SoyosourceService:
         self.last_demand = 0            # last demand we sent (watts)
         self.energy_kwh = 0.0           # running forward energy
         self.last_energy_ts = time.time()
+
+        # Lazy-cached proxy for /Dc/Battery/Voltage on com.victronenergy.system.
+        # Resolved on first read and refreshed automatically on systemcalc
+        # restarts via follow_name_owner_changes=True. See _read_battery_voltage.
+        self._battery_voltage_proxy = None
+
+        # Diagnostics: 60s heartbeat + drift detector. Demand-change logs don't
+        # show the steady-state wedge pattern (frame count, grid convergence),
+        # so we emit a compact status line every minute and a WARNING when
+        # commanded demand stops moving the grid reading toward target.
+        self.tx_count = 0
+        self.last_heartbeat_ts = time.time()
+        self.drift_ticks = 0
+        self.drift_warned = False
 
         self.running = True
 
@@ -676,6 +868,71 @@ class SoyosourceService:
             self.serial.write(zero)
             time.sleep(gap_s)
 
+    # ------------------------------------------------------------------ DC estimation
+    def _read_battery_voltage(self):
+        """
+        Read /Dc/Battery/Voltage from com.victronenergy.system.
+
+        systemcalc publishes this path by copying from the elected battery
+        service (JKBMS, BMV, SmartShunt, etc.). Cached proxy uses
+        follow_name_owner_changes=True so a systemcalc restart doesn't strand
+        us on a dead connection ID.
+
+        Returns float on success, None if unreachable or not yet published.
+        """
+        if self._battery_voltage_proxy is None:
+            try:
+                self._battery_voltage_proxy = self.bus.get_object(
+                    'com.victronenergy.system', '/Dc/Battery/Voltage',
+                    follow_name_owner_changes=True)
+            except dbus.DBusException:
+                return None
+        try:
+            raw = self._battery_voltage_proxy.GetValue(
+                dbus_interface='com.victronenergy.BusItem')
+            return float(raw)
+        except (dbus.DBusException, TypeError, ValueError):
+            # Either systemcalc isn't reachable (transient) or the path isn't
+            # published yet (no battery monitor). Caller handles None.
+            return None
+
+    def _estimate_dc(self, p_ac):
+        """
+        Estimate /Dc/0/{Voltage,Current,Power} from commanded AC output.
+
+        Returns (voltage, current, power) with systemcalc's sign convention:
+          voltage > 0 (V)
+          current < 0 when inverting (current flowing OUT of DC bus into us)
+          power   < 0 when inverting
+
+        Why negative current: systemcalc's comment at dbus_systemcalc.py line
+        ~812 spells it out — "VE.Bus: Positive: current flowing from the Multi
+        to the dc system or battery". We're pushing power the other way, so
+        current is negative from the DC bus's perspective. Same convention for
+        non-vebus inverters (`inverter_power += V*I`, compared against the
+        AC-side fallback `inverter_power -= V_ac*I_ac` which is always
+        negative).
+
+        When p_ac == 0 we return zero current/power regardless of voltage
+        availability so an idle inverter doesn't pollute DcSystemPower.
+
+        If /Dc/Battery/Voltage isn't published (no battery monitor, or
+        systemcalc down), we fall back to FALLBACK_BATTERY_VOLTAGE. Worst
+        case the current magnitude is off by the voltage ratio — the sign
+        and the ballpark are still right, which is what DcSystemPower
+        accounting needs.
+        """
+        v = self._read_battery_voltage()
+        if v is None or v <= 0:
+            v = FALLBACK_BATTERY_VOLTAGE
+        if p_ac <= 0:
+            return (v, 0.0, 0.0)
+        # DC input has to be slightly higher than AC output due to conversion
+        # losses — so current drawn from battery is p_ac/efficiency/V.
+        p_dc = p_ac / INVERTER_EFFICIENCY
+        i = -p_dc / v
+        return (v, i, -p_dc)
+
     # ------------------------------------------------------------------ TX loop
     def _tx_tick(self):
         """Send the current demand to the inverter. Runs every send_interval_s."""
@@ -706,6 +963,7 @@ class SoyosourceService:
         frame = soyosource.build_demand_frame(target)
         ok = self.serial.write(frame)
         if ok:
+            self.tx_count += 1
             log.debug("Sent demand %dW: %s", target, frame.hex(' '))
         return True
 
@@ -749,6 +1007,9 @@ class SoyosourceService:
                      _mode_name(self.mode), grid_str, self.last_demand, new_demand)
         self.last_demand = new_demand
 
+        self._heartbeat(now, grid)
+        self._check_drift(grid)
+
         # Integrate commanded energy (rough — inverter reports ~98% of command)
         dt = now - self.last_energy_ts
         self.energy_kwh += (self.last_demand * dt) / 3600000.0
@@ -768,6 +1029,82 @@ class SoyosourceService:
         self._publish(status)
         return True
 
+    # ----------------------------------------------------------- Instrumentation
+    HEARTBEAT_INTERVAL_S = 60.0
+
+    # Drift = commanding real demand but grid isn't pulling toward target.
+    # - Needs at least DRIFT_DEMAND_MIN_W commanded to make the signal meaningful
+    #   (tiny commands legitimately don't move a noisy grid meter).
+    # - WARN_TOLERANCE_W is the gap-above-target that counts as drift; kept wide
+    #   because household load spikes routinely push grid 100-200 W above target
+    #   even when the inverter is fine.
+    # - CLEAR_TOLERANCE_W is a tighter band used for hysteresis: the gap has to
+    #   drop well below the warn threshold before we announce recovery. Without
+    #   this, a fluctuating grid crossing WARN_TOLERANCE_W flaps the warning on
+    #   and off every few seconds.
+    # - THRESHOLD_TICKS is how many consecutive update ticks above
+    #   WARN_TOLERANCE_W must accumulate before warning. At
+    #   UpdateIntervalSeconds=1s the default is 30 s of drift.
+    DRIFT_DEMAND_MIN_W = 100
+    DRIFT_WARN_TOLERANCE_W = 300
+    DRIFT_CLEAR_TOLERANCE_W = 100
+    DRIFT_THRESHOLD_TICKS = 30
+
+    def _heartbeat(self, now, grid):
+        if now - self.last_heartbeat_ts < self.HEARTBEAT_INTERVAL_S:
+            return
+        elapsed = now - self.last_heartbeat_ts
+        grid_str = '%.1fW' % grid if grid is not None else 'n/a'
+        if self.grid.last_update:
+            age_str = '%.1fs' % max(0.0, now - self.grid.last_update)
+        else:
+            age_str = 'never'
+        log.info("heartbeat: mode=%s demand=%dW grid=%s grid_age=%s tx=%d/%.0fs",
+                 _mode_name(self.mode), self.last_demand, grid_str,
+                 age_str, self.tx_count, elapsed)
+        self.tx_count = 0
+        self.last_heartbeat_ts = now
+
+    def _check_drift(self, grid):
+        """Detect wedge: commanded demand > DRIFT_DEMAND_MIN_W for
+        DRIFT_THRESHOLD_TICKS but grid stays > target + DRIFT_WARN_TOLERANCE_W.
+        Hysteresis: warn above WARN band, clear only below tighter CLEAR band;
+        inside the deadband we keep whatever state we had."""
+        if (self.mode != MODE_ON
+                or grid is None
+                or self.grid.is_stale(self.cfg.stale_timeout_s)):
+            # Lost the signal we'd base drift on. Reset silently.
+            self.drift_ticks = 0
+            self.drift_warned = False
+            return
+
+        if self.last_demand < self.DRIFT_DEMAND_MIN_W:
+            # Not commanding enough to expect observable grid movement.
+            self.drift_ticks = 0
+            self.drift_warned = False
+            return
+
+        gap = grid - self.cfg.target_grid_w
+
+        if gap > self.DRIFT_WARN_TOLERANCE_W:
+            self.drift_ticks += 1
+            if self.drift_ticks == self.DRIFT_THRESHOLD_TICKS and not self.drift_warned:
+                log.warning(
+                    "DRIFT: commanded %dW for %d ticks, grid=%.1fW still %.1fW above "
+                    "target=%dW. Inverter may be wedged (physical production not "
+                    "matching command).",
+                    self.last_demand, self.drift_ticks, grid, gap,
+                    self.cfg.target_grid_w,
+                )
+                self.drift_warned = True
+        elif gap < self.DRIFT_CLEAR_TOLERANCE_W:
+            if self.drift_warned:
+                log.info("DRIFT cleared: demand=%dW grid=%.1fW (back within tolerance)",
+                         self.last_demand, grid)
+            self.drift_ticks = 0
+            self.drift_warned = False
+        # else: deadband — keep current ticks/warned state, no log
+
     # ------------------------------------------------------------ D-Bus publish
     def _publish(self, status):
         p = self.last_demand
@@ -778,25 +1115,115 @@ class SoyosourceService:
         v = 230.0
         if status and status['ac_voltage']:
             v = float(status['ac_voltage'])
+        current = (p / v) if v else 0.0
+
+        if self.cfg.service_type == 'pvinverter':
+            self._publish_pvinverter(p, phase, v, current)
+        elif self.cfg.service_type == 'vebus':
+            self._publish_vebus(p, phase, v, current, status)
+        else:  # inverter
+            self._publish_inverter(p, phase, v, current, status)
+
+    def _publish_pvinverter(self, p, phase, v, current):
+        # Standard pvinverter paths: /Ac/Power + /Ac/<L>/{Power,Voltage,
+        # Current,Energy/Forward}. No /Dc/*, no /State, no Multi-style
+        # /Ac/Out/* — systemcalc treats this as AC-coupled production on the
+        # grid bus and subtracts it from ConsumptionOnInput.
+        self.svc['/Ac/Power'] = p
+        self.svc['/Ac/Energy/Forward'] = self.energy_kwh
+        self.svc['/Ac/%s/Power' % phase] = p
+        self.svc['/Ac/%s/Voltage' % phase] = v
+        self.svc['/Ac/%s/Current' % phase] = current
+        self.svc['/Ac/%s/Energy/Forward' % phase] = self.energy_kwh
+        # Fronius-style: 7 = Running, 8 = Standby. GUIv2 renders the tile
+        # differently for each.
+        self.svc['/StatusCode'] = 7 if p > 0 else 8
+
+    def _publish_vebus(self, p, phase, v, current, status):
+        # Negative /Ac/ActiveIn/<L>/P = we're pushing power OUT of the AC
+        # input terminal, back to the grid bus. That's ESS-mode semantics,
+        # and it's exactly what makes systemcalc's
+        #   ConsumptionOnInput[Lx] = Grid[Lx] - ActiveIn[Lx]
+        # come out right: subtract a negative = add our production.
+        self.svc['/Ac/ActiveIn/%s/P' % phase] = -p
+        self.svc['/Ac/ActiveIn/%s/V' % phase] = v
+        self.svc['/Ac/ActiveIn/%s/I' % phase] = -current
+        if status and status['ac_frequency']:
+            self.svc['/Ac/ActiveIn/%s/F' % phase] = float(status['ac_frequency'])
+
+        # AC Output stays zero — no essential-loads bus.
+        self.svc['/Ac/Out/%s/P' % phase] = 0.0
+        self.svc['/Ac/Out/%s/V' % phase] = v
+        self.svc['/Ac/Out/%s/I' % phase] = 0.0
+
+        # State: 9 = inverting (producing); 0 = off. Mirror on VebusMainState.
+        state = 9 if p > 0 else 0
+        self.svc['/State'] = state
+        self.svc['/VebusMainState'] = state
+
+        # Energy: integrate "inverter→AC-in1" (power flowing from our DC side
+        # out our AC input terminal to grid).
+        self.svc['/Energy/InverterToAcIn1'] = self.energy_kwh
+
+        # DC side. Two sources:
+        #   status present (response to status query) — use inverter's own V/I.
+        #     Soyosource reports battery_current as positive magnitude, so we
+        #     negate when inverting to match systemcalc's "positive = current
+        #     flowing from Multi to DC" convention.
+        #   status absent (2022 purple mainboards) — estimate from commanded
+        #     AC power and the system-wide battery voltage. Essential for
+        #     correct Total-Consumption accounting: without this, systemcalc
+        #     attributes the whole battery discharge to "DC Loads".
+        if status and status['battery_voltage']:
+            v_dc = float(status['battery_voltage'])
+            i_mag = float(status['battery_current'])  # positive magnitude
+            i_dc = -i_mag if p > 0 else 0.0
+            self.svc['/Dc/0/Voltage'] = v_dc
+            self.svc['/Dc/0/Current'] = i_dc
+            self.svc['/Dc/0/Power'] = v_dc * i_dc
+            self.svc['/Temperature'] = status['temperature']
+        else:
+            v_dc, i_dc, p_dc = self._estimate_dc(p)
+            if v_dc is not None:
+                self.svc['/Dc/0/Voltage'] = v_dc
+                self.svc['/Dc/0/Current'] = i_dc
+                self.svc['/Dc/0/Power'] = p_dc
+
+    def _publish_inverter(self, p, phase, v, current, status):
+        if status and status['ac_voltage']:
             self.svc['/Ac/Out/%s/V' % phase] = v
         if status and status['ac_frequency']:
             self.svc['/Ac/Out/%s/F' % phase] = float(status['ac_frequency'])
 
         self.svc['/Ac/Out/%s/P' % phase] = p
-        self.svc['/Ac/Out/%s/I' % phase] = (p / v) if v else 0.0
+        self.svc['/Ac/Out/%s/I' % phase] = current
 
         # State: inverting iff producing power
         self.svc['/State'] = 9 if p > 0 else 0
 
         self.svc['/Energy/InverterToAcOut'] = self.energy_kwh
 
-        if status:
-            v_dc = status['battery_voltage']
-            i_dc = status['battery_current']
+        # Same DC estimation as the vebus branch — systemcalc treats non-vebus
+        # `inverter` services with the parallel formula
+        #     inverter_power += V_dc * I_dc
+        # (and falls back to -V_ac * I_ac if DC is missing). Sign convention
+        # matches: I_dc negative when inverting. Without this, our DC draw
+        # goes unaccounted and Total Consumption gets inflated with phantom
+        # DC loads.
+        if status and status['battery_voltage']:
+            v_dc = float(status['battery_voltage'])
+            i_mag = float(status['battery_current'])
+            i_dc = -i_mag if p > 0 else 0.0
             self.svc['/Dc/0/Voltage'] = v_dc
             self.svc['/Dc/0/Current'] = i_dc
             self.svc['/Dc/0/Power'] = v_dc * i_dc
             self.svc['/Temperature'] = status['temperature']
+        else:
+            v_dc, i_dc, p_dc = self._estimate_dc(p)
+            if v_dc is not None:
+                self.svc['/Dc/0/Voltage'] = v_dc
+                self.svc['/Dc/0/Current'] = i_dc
+                self.svc['/Dc/0/Power'] = p_dc
 
     # -------------------------------------------------------- Signal / shutdown
     def _on_signal(self, signum, frame):

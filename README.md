@@ -36,9 +36,12 @@ pulling from the grid, without ever exporting.
                    Battery (DC)
 ```
 
-The service publishes itself as `com.victronenergy.inverter.soyosource_<N>`
-so the inverter shows up in the GUIv2 **Inverter / Charger** tile and in
-the VRM portal.
+The service registers as `com.victronenergy.vebus.soyosource_<N>` by default —
+"Multi emulation" — so the Soyosource shows up in the GUIv2 **Inverter /
+Charger** tile as "Inverting", feeds correctly into Total Consumption
+(via `/Ac/ActiveIn/<L>/P` with a negative sign, ESS-style), and is *not*
+lumped into "Solar yield". Alternative service types are available for
+niche setups — see the `ServiceType` row in the config table below.
 
 ## Hardware
 
@@ -165,10 +168,10 @@ below.
 | `SerialPort` | `/dev/ttyUSB3` | Serial port the RS-485 adapter is on. Use `ls /dev/serial/by-id/` to find the right one; prefer a stable `/dev/serial/by-id/...` path since `ttyUSB<N>` numbers can shuffle on reboot. |
 | `Phase` | `L1` | Physical wiring: which AC phase the Soyosource is fed into. Reported on `/Settings/System/AcPhase` and used for the `/Ac/Out/<phase>/*` D-Bus paths. Valid values: `L1`, `L2`, `L3`. |
 | `TrackPhase` | `ALL` | Which grid-meter reading(s) the control loop follows. `L1`/`L2`/`L3` = read one phase path. `ALL` = sum `/Ac/Grid/L1/Power` + `L2` + `L3`. Use `ALL` if your utility meter nets all phases for billing (typical in the EU) — a single-phase inverter on `L1` can then offset loads across all three phases. Use a specific phase if your billing is *per-phase* (some older installs), or if you only want to compensate loads on the wiring phase. |
-| `DeviceInstance` | `41` | Unique D-Bus device instance. Must not collide with other Victron devices on the same system. The service registers as `com.victronenergy.inverter.soyosource_<DeviceInstance>`. Changing it after install creates a *new* device entry; clean the stale one via the GUI's *Remove disconnected devices* button. |
+| `DeviceInstance` | `41` | Unique D-Bus device instance. Must not collide with other Victron devices on the same system. The service registers as `com.victronenergy.<ServiceType>.soyosource_<DeviceInstance>`. Changing it after install creates a *new* device entry; clean the stale one via the GUI's *Remove disconnected devices* button. |
 | `CustomName` | `Soyosource GTN` | Display name in the GUI and VRM. Cosmetic only. |
-| `AcPosition` | `1` | Reserved for forward compatibility. Unused by the `inverter` service type. |
-| `ServiceType` | `inverter` | D-Bus service class. Keep `inverter`; `vebus` would show power on the GUIv2 tile but crashes `dbus-systemcalc-py`'s DVCC delegate on non-Multiplus systems. See CLAUDE.md. |
+| `AcPosition` | `1` | Reserved for forward compatibility. Currently unused. |
+| `ServiceType` | `vebus` | D-Bus service class. **`vebus`** (default) — Multi emulation; correct consumption math, Inverter/Charger tile, no Solar-yield mis-labelling. Do NOT use if you also have a real Multiplus. **`pvinverter`** — correct math but shows up under "Solar yield"; use this if a real Multi is present. **`inverter`** — shows Mode dialog, but double-counts output as Essential Loads. See CLAUDE.md for the full rationale and the landmines each option does or doesn't trip. |
 | `UpdateIntervalSeconds` | `1.0` | How often the control loop reads grid power and recomputes demand. Faster = more responsive; slower = smoother. The grid meter usually only updates every 1–3 s, so values below 1 s rarely help. |
 | `SendIntervalSeconds` | `0.5` | How often the current demand frame is retransmitted on RS-485. The inverter auto-offs after ~10 s without a frame — keep this well below. The OEM meter uses ~500 ms. |
 | `GridStaleTimeoutSeconds` | `10` | Safety timeout. If the grid reading stops updating for this long, demand is forced to 0 W. |
@@ -181,9 +184,24 @@ below.
 
 ### Inverter mode — On / Eco / Off
 
-In GUIv2, the Soyosource device page has an **Inverter mode** switch with
-three options. This is the only runtime control — it writes `/Mode` on our
-D-Bus service and the control loop responds immediately.
+The service exposes a writable `/Mode` path with three values. This is the
+only runtime control — write it and the control loop responds immediately.
+
+With `ServiceType = pvinverter` (default), GUIv2 does **not** render a Mode
+dialog on the device page (that's a Multi/Inverter-tile UI). Flip the mode
+over D-Bus, MQTT, or Node-RED instead:
+
+```bash
+# On  (normal grid-following)
+dbus -y com.victronenergy.pvinverter.soyosource_41 /Mode SetValue 2
+# Eco (fixed EcoPowerDemand watts)
+dbus -y com.victronenergy.pvinverter.soyosource_41 /Mode SetValue 5
+# Off (stop TX, inverter auto-offs)
+dbus -y com.victronenergy.pvinverter.soyosource_41 /Mode SetValue 4
+```
+
+Switch to `ServiceType = inverter` if you want the native GUIv2 dialog (at
+the cost of wrong consumption accounting — see the config table above).
 
 | Mode | D-Bus value | Behaviour |
 |---|---|---|
@@ -195,7 +213,7 @@ The mode is **not persisted** — a service restart always comes back up in
 `On`. If you want the inverter genuinely off across reboots, stop the service
 (`svc -d /service/dbus-soyosource`) instead.
 
-![GUIv2 Inverter mode dialog showing the On / Eco / Off radio options on the Soyosource GTN device page](img/inverter-mode.png)
+![GUIv2 Inverter mode dialog showing the On / Eco / Off radio options on the Soyosource GTN device page — only rendered when ServiceType=inverter](img/inverter-mode.png)
 
 ### How the control loop works (On mode)
 
@@ -235,16 +253,22 @@ frames before exiting.
 * **Service log** — `tail -F /var/log/dbus-soyosource/current` shows every
   demand change, e.g. `mode=On grid=156.4W demand 80 -> 175`.
 
-* **GUIv2** — `http://<gx-ip>/gui-v2/` should show "Inverter / Charger:
-  Inverting". Under **Settings → Devices** you'll find a `Soyosource GTN`
-  entry showing the current output power:
+* **GUIv2** — `http://<gx-ip>/gui-v2/` should show the Soyosource's
+  production folded into the "PV" tile (or, with `ServiceType=inverter`,
+  the "Inverter / Charger" tile as "Inverting"). Under **Settings →
+  Devices** you'll find a `Soyosource GTN` entry showing the current
+  output power:
 
   ![VenusOS Settings → Devices list with Soyosource GTN producing 457 W alongside the BMS and Shelly 3EM grid meter](img/device-list.png)
 
-  The device detail page shows the current AC output and the **Inverter
-  mode** switch (On / Eco / Off — see above):
+  With `ServiceType=inverter`, the device detail page shows an AC Out row
+  and the **Inverter mode** switch (On / Eco / Off — see above):
 
   ![Soyosource GTN device page with Mode=On, State=Inverting, AC Out=230 V / 2.1 A / 480 W](img/device-page.png)
+
+  With `ServiceType=pvinverter` (default), the device page shows the PV
+  production values (L1 voltage, current, power, forward energy) without
+  a Mode switch.
 
 ## Known limitations
 
@@ -254,10 +278,14 @@ frames before exiting.
   `/Dc/0/*` and `/Temperature` on the D-Bus service stay empty. We have no
   way to detect inverter faults from the bus — only from the LCD.
 
-* **GUIv2 Inverter/Charger tile shows state, not power.** The wattage is on
-  the device detail page (one tap away). This is a tradeoff to avoid the
-  `vebus` service type, which would show the power but breaks `dbus-systemcalc-py`
-  on non-Multiplus systems. See CLAUDE.md for the full story.
+* **Mode dialog only under `ServiceType=inverter`.** With the default
+  `pvinverter`, GUIv2 doesn't render a Mode switch on the device page —
+  flip modes via `dbus` / MQTT / Node-RED instead (see the *Inverter mode*
+  section above). `pvinverter` is the default because it gives correct
+  Total-Consumption accounting; `inverter` double-counts the Soyosource
+  output as Essential Loads. `vebus` would give both correct accounting
+  and the Mode switch but crashes `dbus-systemcalc-py` on non-Multiplus
+  systems — see CLAUDE.md.
 
 * **Single-phase only.** The service follows one phase of the grid meter.
   Multi-phase setups need one service instance per inverter (not yet
