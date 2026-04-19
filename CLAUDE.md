@@ -239,6 +239,27 @@ out, inverter ignores them" (tx count steady, grid stays high).
   service handles the missing telemetry gracefully — `/Temperature` stays
   empty; `/Dc/0/{Voltage,Current,Power}` are *estimated* (see next gotcha).
 
+- **Cold-boot USB wedge: TX LED flashes, no bytes on the wire.** Reproducible
+  on this setup (Pi 2, DSD TECH SH-U11F on a USB hub): after a VenusOS cold
+  boot, pyserial opens fine and every `write()` returns success, but the
+  inverter stays at 0 W and the battery doesn't discharge. Physical
+  unplug+replug of the USB adapter recovers it reliably. The fix is to do
+  the same thing in software: write the USB interface name (e.g.
+  `1-1.3.1:1.0`) to `/sys/bus/usb/drivers/ftdi_sio/unbind`, wait 1 s, then
+  the same name to `.../bind`. The tty comes back with the same name
+  (serial-starter lock stays valid) and the by-id symlink also resolves to
+  the same tty — our config doesn't need to know or care about the
+  underlying tty number. `usb_reset_adapter()` implements the sequence;
+  `_maybe_auto_reset()` triggers it once per hour when the battery monitor
+  reports ≥ -50 W (i.e. not discharging) despite commanded demand ≥ 100 W,
+  after an initial 30 s settling window at startup. Needs
+  `/Dc/Battery/Power` on `com.victronenergy.system` (i.e. a battery monitor
+  has to be present) — without it the wedge is only visible via the grid-
+  based drift detector and the user has to intervene. Root cause of the
+  wedge itself is unknown; likely either the FT232R's internal state after
+  a warm-boot of the Pi or a USB enumeration race — either way the replug
+  fixes it and we don't need to dig further.
+
 - **Missing `/Dc/0/*` on vebus/inverter services inflates "DC Loads" in Total
   Consumption.** systemcalc computes `vebuspower = V * I` per vebus service
   (and `inverter_power += V_dc * I_dc` for non-vebus `inverter` services),

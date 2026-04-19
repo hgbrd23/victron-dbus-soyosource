@@ -57,6 +57,28 @@ INVERTER_EFFICIENCY = 0.94
 # enough and the drift is bounded by the efficiency factor anyway.
 FALLBACK_BATTERY_VOLTAGE = 52.0
 
+# Auto-recovery from the cold-boot USB wedge (TX LED flashes but nothing
+# reaches the wire). See usb_reset_adapter() and _maybe_auto_reset().
+#
+#   DELAY_S — how long to wait after startup before the first check. Gives the
+#     grid-follower loop a chance to ramp demand to something meaningful and
+#     the battery monitor time to respond. 30 s is comfortably longer than
+#     the grid-meter refresh + inverter spin-up.
+#   COOLDOWN_S — minimum interval between auto-replug attempts during a
+#     single service lifetime. 1 h is long enough that we don't churn the
+#     adapter if the reset itself didn't help, but short enough to recover
+#     from a fresh glitch hours later without the user intervening.
+#   COMMAND_W — minimum commanded demand before we trust the wedge signal.
+#     Below this the grid-follower isn't asking for much, and small
+#     commands legitimately don't show up on the battery monitor.
+#   DISCHARGE_W — when battery_power is more negative than this (i.e.
+#     discharging ≥ this many watts), the inverter is clearly drawing and we
+#     consider the system healthy regardless of the commanded value.
+AUTO_RESET_STARTUP_DELAY_S = 30.0
+AUTO_RESET_COOLDOWN_S = 3600.0
+AUTO_RESET_COMMAND_THRESHOLD_W = 100
+AUTO_RESET_DISCHARGE_THRESHOLD_W = 50
+
 
 def _mode_name(mode):
     return _MODE_NAMES.get(mode, 'Mode(%d)' % mode)
@@ -212,6 +234,88 @@ def release_serial_starter_lock(lock_path):
             log.info("Released serial-starter lock %s", lock_path)
     except OSError:
         pass
+
+
+def usb_reset_adapter(port_path):
+    """
+    Soft-replug the USB serial adapter by unbinding and rebinding its
+    ftdi_sio driver binding. The kernel-visible effect is identical to
+    physically unplugging the adapter and plugging it back in.
+
+    Why: on cold boot, the FT232R on VenusOS occasionally comes up in a
+    half-wedged state — pyserial opens fine, the TX LED flashes on every
+    write, but no bytes actually reach the wire. User-verified fix is a
+    physical replug. This function replicates it without human hands.
+
+    Sequence (requires root):
+      1. Resolve the by-id path (or ttyUSB<N>) to the sysfs USB interface,
+         e.g. /sys/class/tty/ttyUSB2/device/.. → 1-1.3.1:1.0.
+      2. Write the interface name to /sys/bus/usb/drivers/ftdi_sio/unbind.
+         The tty disappears within ~1 s.
+      3. Sleep briefly so the kernel finishes teardown.
+      4. Write the same name to /sys/bus/usb/drivers/ftdi_sio/bind.
+         The tty re-enumerates; because we're using the by-id path keyed on
+         the FTDI serial number, the symlink resolves to the same tty name.
+      5. Wait up to 10 s for the by-id path to reappear.
+
+    The caller must have closed any open pyserial handle first (unbind
+    would invalidate it anyway).
+
+    Preserves the serial-starter lock because the tty basename doesn't
+    change across the cycle.
+
+    Returns True on success, False on any failure (caller continues as best
+    it can — worst case the next TX reopen fails and the drift detector
+    still flags the wedge).
+    """
+    try:
+        tty_path = os.path.realpath(port_path)  # /dev/ttyUSB2
+        tty_name = os.path.basename(tty_path)
+        # /sys/class/tty/<name>/device → the usb-serial class device.
+        # Its parent is the USB interface — that's what unbind/bind expect.
+        iface = os.path.basename(
+            os.path.realpath('/sys/class/tty/%s/device/..' % tty_name))
+    except OSError as e:
+        log.warning("USB reset: cannot resolve sysfs path for %s: %s", port_path, e)
+        return False
+
+    # Sanity check: USB interface names look like "X-Y:A.B" (bus-port:cfg.iface).
+    # Anything else means our resolution fell through to something unexpected,
+    # and writing garbage to unbind could unwire an unrelated device.
+    if ':' not in iface:
+        log.warning("USB reset: suspicious interface name %r for %s; aborting",
+                    iface, port_path)
+        return False
+
+    log.info("USB reset: unbinding %s from ftdi_sio (tty=%s)", iface, tty_name)
+    try:
+        with open('/sys/bus/usb/drivers/ftdi_sio/unbind', 'w') as f:
+            f.write(iface)
+    except OSError as e:
+        log.warning("USB reset: unbind failed: %s", e)
+        return False
+
+    # Let the kernel finish tearing down. 500 ms is enough in practice.
+    time.sleep(1.0)
+
+    log.info("USB reset: rebinding %s to ftdi_sio", iface)
+    try:
+        with open('/sys/bus/usb/drivers/ftdi_sio/bind', 'w') as f:
+            f.write(iface)
+    except OSError as e:
+        log.warning("USB reset: bind failed: %s", e)
+        return False
+
+    # Wait for udev to recreate the by-id symlink we actually use.
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if os.path.exists(port_path):
+            log.info("USB reset complete: %s is back", port_path)
+            return True
+        time.sleep(0.2)
+
+    log.warning("USB reset: %s did not reappear within 10s", port_path)
+    return False
 
 
 class SerialLink:
@@ -810,10 +914,17 @@ class SoyosourceService:
         self.energy_kwh = 0.0           # running forward energy
         self.last_energy_ts = time.time()
 
-        # Lazy-cached proxy for /Dc/Battery/Voltage on com.victronenergy.system.
-        # Resolved on first read and refreshed automatically on systemcalc
-        # restarts via follow_name_owner_changes=True. See _read_battery_voltage.
+        # Lazy-cached proxies for /Dc/Battery/{Voltage,Power} on
+        # com.victronenergy.system. Resolved on first read and refreshed
+        # automatically on systemcalc restarts via follow_name_owner_changes=True.
         self._battery_voltage_proxy = None
+        self._battery_power_proxy = None
+
+        # Auto-reset state (see _maybe_auto_reset). _service_start_ts gates the
+        # first check; _last_auto_reset_ts enforces the per-lifetime cooldown
+        # so we don't churn the adapter if the replug didn't help.
+        self._service_start_ts = time.time()
+        self._last_auto_reset_ts = 0.0
 
         # Diagnostics: 60s heartbeat + drift detector. Demand-change logs don't
         # show the steady-state wedge pattern (frame count, grid convergence),
@@ -894,6 +1005,30 @@ class SoyosourceService:
         except (dbus.DBusException, TypeError, ValueError):
             # Either systemcalc isn't reachable (transient) or the path isn't
             # published yet (no battery monitor). Caller handles None.
+            return None
+
+    def _read_battery_power(self):
+        """
+        Read /Dc/Battery/Power from com.victronenergy.system.
+
+        Sign convention: positive = charging, negative = discharging. Used
+        by the wedge detector to distinguish "inverter drawing from battery"
+        (healthy) from "inverter silent despite commanded demand" (wedged).
+
+        Returns float on success, None if unreachable or not yet published.
+        """
+        if self._battery_power_proxy is None:
+            try:
+                self._battery_power_proxy = self.bus.get_object(
+                    'com.victronenergy.system', '/Dc/Battery/Power',
+                    follow_name_owner_changes=True)
+            except dbus.DBusException:
+                return None
+        try:
+            raw = self._battery_power_proxy.GetValue(
+                dbus_interface='com.victronenergy.BusItem')
+            return float(raw)
+        except (dbus.DBusException, TypeError, ValueError):
             return None
 
     def _estimate_dc(self, p_ac):
@@ -1009,6 +1144,7 @@ class SoyosourceService:
 
         self._heartbeat(now, grid)
         self._check_drift(grid)
+        self._maybe_auto_reset()
 
         # Integrate commanded energy (rough — inverter reports ~98% of command)
         dt = now - self.last_energy_ts
@@ -1104,6 +1240,81 @@ class SoyosourceService:
             self.drift_ticks = 0
             self.drift_warned = False
         # else: deadband — keep current ticks/warned state, no log
+
+    # --------------------------------------------------------- Auto USB replug
+    def _maybe_auto_reset(self):
+        """
+        Recover from the cold-boot USB wedge automatically.
+
+        Symptom we're catching: pyserial reports writes succeeding, the TX
+        LED on the FT232R flashes, but the inverter's display stays at 0 W
+        and the battery isn't actually discharging. The user verified that a
+        physical replug of the USB adapter always recovers it; we do the
+        same thing in software by unbinding and rebinding the ftdi_sio
+        driver (see usb_reset_adapter).
+
+        Detection relies on the battery monitor, which is more reliable
+        than the grid meter for this purpose — the grid can legitimately
+        read zero for a few seconds when a household load cycles off, but
+        the battery state tracks physical power flow directly. We consider
+        it a wedge iff:
+
+          1. Service has been running ≥ AUTO_RESET_STARTUP_DELAY_S
+             (give the control loop time to ramp up and the battery
+             monitor time to respond),
+          2. We're in MODE_ON (Eco/Off are ignored; Off doesn't even TX
+             and Eco is a user override),
+          3. Commanded demand ≥ AUTO_RESET_COMMAND_THRESHOLD_W (below
+             this the signal is lost in battery-monitor noise),
+          4. Battery is NOT discharging by at least
+             AUTO_RESET_DISCHARGE_THRESHOLD_W (if it IS, the inverter is
+             clearly drawing DC power — not wedged),
+          5. Last reset attempt was ≥ AUTO_RESET_COOLDOWN_S ago
+             (prevents a churn if the replug itself didn't help).
+
+        One-shot behaviour. If the replug doesn't restore production, the
+        drift detector will still log DRIFT warnings for visibility, and
+        the user can intervene manually.
+        """
+        if self.mode != MODE_ON:
+            return
+        if self.last_demand < AUTO_RESET_COMMAND_THRESHOLD_W:
+            return
+
+        now = time.time()
+        uptime = now - self._service_start_ts
+        if uptime < AUTO_RESET_STARTUP_DELAY_S:
+            return
+        if now - self._last_auto_reset_ts < AUTO_RESET_COOLDOWN_S:
+            return
+
+        bp = self._read_battery_power()
+        if bp is None:
+            # No battery monitor reachable; we have no way to tell. Let the
+            # drift detector (grid-based) pick it up instead.
+            return
+        if bp < -AUTO_RESET_DISCHARGE_THRESHOLD_W:
+            # Healthy: inverter is drawing from battery.
+            return
+
+        log.warning("USB wedge suspected: mode=On commanded=%dW but "
+                    "battery_power=%.1fW (not discharging). Attempting soft "
+                    "replug of the FT232R (unbind+rebind ftdi_sio).",
+                    self.last_demand, bp)
+        self._last_auto_reset_ts = now
+
+        # Close pyserial so the kernel can cleanly release the tty. The
+        # serial-starter lock stays in place (symlink is tty-name-keyed and
+        # the tty basename survives the unbind/bind cycle).
+        self.serial.close()
+
+        if usb_reset_adapter(self.cfg.serial_port):
+            log.info("USB replug succeeded — next TX tick will reopen and "
+                     "resume frames")
+        else:
+            log.warning("USB replug did not complete cleanly; the next TX "
+                        "tick will still try to reopen, and may recover on "
+                        "its own")
 
     # ------------------------------------------------------------ D-Bus publish
     def _publish(self, status):
