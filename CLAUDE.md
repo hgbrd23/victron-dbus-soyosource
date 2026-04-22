@@ -211,6 +211,66 @@ around the transition + the DRIFT warning timestamp together pin down whether
 the issue is "our frames stopped going out" (tx count drops) vs. "frames go
 out, inverter ignores them" (tx count steady, grid stays high).
 
+### Wedge handling (detection, UI suppression, auto-replug)
+
+Root predicate: `_inverter_appears_wedged()`. True when mode=On, commanded
+demand ≥ 100 W, `/Dc/Battery/Power` reachable, and observed battery power
+exceeds the *expected* battery power by ≥ 50 W, where
+`expected_bp = solar_w − commanded_dc` (solar from `/Dc/Pv/Power` on
+`com.victronenergy.system`, commanded_dc = commanded_ac / efficiency).
+Covers every "silent despite command" failure mode — cold-boot USB wedge,
+Soyosource UVP lockout, thermal protection, loose RS-485 wiring — because
+they all manifest the same way: our DC draw doesn't show up in the battery
+flow. Comparing against expected-not-zero is essential when PV is active:
+if solar produces 1600 W and we command 450 W DC, a healthy inverter
+leaves the battery charging at ~1150 W net — the original zero-based check
+("battery not discharging by 50 W") painted the UI tile "Off" all
+afternoon, even while the inverter was working correctly. On systems with
+no MPPTs, `/Dc/Pv/Power` returns 0 and the check collapses back to the
+original "battery must be discharging" semantics. Sits in the main update
+tick and drives two behaviours:
+
+1. **D-Bus publish suppression.** `believed_ac_power = 0` when wedged, else
+   `last_demand`. All downstream paths (`/Ac/ActiveIn/<L>/P`, `/Dc/0/*`,
+   `/State`, energy integration) publish from `believed_ac_power`. Without
+   this, `ConsumptionOnInput[L1]` and `DcSystemPower` both inflate by
+   ~900 W and Total Consumption in VRM shows phantom load. RS-485 TX still
+   sends `last_demand` unchanged — orthogonal concerns.
+
+2. **Automatic USB replug, with progressive backoff.** When wedged AND
+   uptime ≥ 30 s AND time since last attempt ≥ cooldown, do one
+   `usb_reset_adapter()` cycle. Cooldown schedule:
+
+   - Attempts 1–2: **5 min** (`AUTO_RESET_SHORT_COOLDOWN_S`)
+   - Attempts 3+: **15 min** (`AUTO_RESET_LONG_COOLDOWN_S`)
+
+   The counter resets to 0 after `AUTO_RESET_HEALTHY_RESET_S = 120 s` of
+   wedge-free operation, so an unrelated problem a day later starts at
+   attempt 1 again, not at "long cooldown from last time".
+
+   Rationale: observed on this rig at least once — first replug succeeded
+   in the kernel (`USB reset complete`), inverter produced for ~5 s, then
+   wedged again. The 15 min wait blocked any recovery for the rest of the
+   load-spike window. Second replug a few minutes later fixed it
+   permanently. So the first two attempts are cheap enough to try at 5
+   min; if neither holds, the cause is probably not a transient USB glitch
+   (inverter thermal / internal fault / UVP — no amount of replugging
+   raises battery voltage) and we back off to 15 min to avoid adapter
+   thrash.
+
+   The RS-485 command keeps going at full demand during every cooldown
+   regardless of attempt count, so when the inverter's own condition
+   clears it picks up instantly without needing a replug at all.
+
+Recovery is automatic on both sides: when the inverter starts actually
+pulling DC current again (battery flow matches `solar − commanded_dc`),
+`_inverter_appears_wedged()` flips False, `believed_ac_power` goes back to
+`last_demand`, UI paths re-publish real values, and a single info log line
+marks the transition. No persistent state, no restart required.
+
+Orthogonal DRIFT detector (grid-based) stays in place as a secondary signal —
+useful when there's no battery monitor on the system.
+
 ### Gotchas hit during development
 
 - **VenusOS serial scanners must be told we own the port — via `lock_tty`.**
@@ -344,7 +404,14 @@ out, inverter ignores them" (tx count steady, grid stays high).
   crashloops, `com.victronenergy.system` drops off the bus and every dependent
   service starts failing. Second attempt (now live) addresses this and the
   adjacent assumptions:
-  - `/FirmwareVersion = 469` (int, passes the dvcc compare).
+  - `/FirmwareVersion = 0x0500` (int, 1280 decimal). Must be ≥
+    `VEBUS_FIRMWARE_REQUIRED = 0x422` (1058 decimal). Value 469 decimal
+    looks plausible ("v4.69"-ish) but as an integer 469 < 1058, so dvcc
+    fires `/Dvcc/Alarms/FirmwareInsufficient = 1` (Victron UI error #48,
+    *"DVCC with incompatible firmware"*). The classic hex/decimal landmine —
+    any chosen value needs to be validated as a decimal integer against
+    the decimal value of the hex constant. Display format is hex-BCD
+    (`"%x.%02x" % (v>>8, v&0xFF)`), so 0x0500 → "v5.00" in UIs.
   - `/Bms/AllowToCharge = /Bms/AllowToDischarge = None` — systemcalc's BMS
     delegate reads `None` and interprets "no vebus BMS", defers to the
     real battery service (JKBMS on SerialBattery). Avoids the BMS handshake
@@ -362,6 +429,20 @@ out, inverter ignores them" (tx count steady, grid stays high).
   - `/Hub4/AssistantId = None` — systemcalc's SystemState delegate treats us
     as "no ESS assistant", avoiding the ExternalControl branch that expects
     Hub4Mode=3 coordination.
+  - `/BatteryOperationalLimits/{MaxChargeVoltage,MaxChargeCurrent,
+    MaxDischargeCurrent,BatteryLowVoltage}` exposed as writable no-op
+    stubs. Once firmware is above threshold, `dvcc.py` writes these on
+    every tick via `set_value_async` (see the `BatteryOperationalLimits`
+    class in `/opt/victronenergy/dbus-systemcalc-py/delegates/dvcc.py`);
+    without receivers we'd either see silent failures or "path doesn't
+    exist" warnings depending on the velib_python version. We accept
+    and log at DEBUG; we have no charger and our discharge rate is
+    driven by the grid-follower, not a DVCC setpoint.
+  - `/ModeIsAdjustable = 1` — makes `/Mode` actually writable from
+    Remote Console / VRM. Without it the Mode dialog renders but
+    silently swallows clicks (symptom: you click "Off" and nothing
+    happens, no dbus trace). Standard on real Multis; easy to miss
+    when emulating.
   - `/Ac/ActiveIn/ActiveInput = 0` (Input 1 live) instead of 240 (disconnected),
     because we want ConsumptionOnInput[L1] to be computed as
     `Grid[L1] - ActiveIn[L1]`. We publish `ActiveIn[L1] = -last_demand`

@@ -57,27 +57,64 @@ INVERTER_EFFICIENCY = 0.94
 # enough and the drift is bounded by the efficiency factor anyway.
 FALLBACK_BATTERY_VOLTAGE = 52.0
 
-# Auto-recovery from the cold-boot USB wedge (TX LED flashes but nothing
-# reaches the wire). See usb_reset_adapter() and _maybe_auto_reset().
+# Wedge-detection + auto-recovery constants.
 #
-#   DELAY_S — how long to wait after startup before the first check. Gives the
-#     grid-follower loop a chance to ramp demand to something meaningful and
+# The same battery-discharge signal drives two behaviours:
+#   (a) Suppressing virtual production on the D-Bus publish paths so the UI
+#       doesn't show phantom load offsetting while the inverter is refusing
+#       to produce (USB-stack wedge, UVP lockout, Soyosource protection, ...).
+#   (b) Gating the automatic ftdi_sio unbind/rebind recovery attempt.
+#
+# The core predicate (_inverter_appears_wedged) is shared between both.
+#
+#   STARTUP_DELAY_S — wait this long after service start before the first
+#     auto-reset attempt. Gives the grid-follower loop time to ramp up and
 #     the battery monitor time to respond. 30 s is comfortably longer than
 #     the grid-meter refresh + inverter spin-up.
-#   COOLDOWN_S — minimum interval between auto-replug attempts during a
-#     single service lifetime. 1 h is long enough that we don't churn the
-#     adapter if the reset itself didn't help, but short enough to recover
-#     from a fresh glitch hours later without the user intervening.
+#   SHORT_COOLDOWN_S / LONG_COOLDOWN_S / SHORT_ATTEMPTS — progressive
+#     backoff for consecutive replug attempts. Observed pattern on Pi 2 +
+#     FT232R: the first auto-replug sometimes gets only ~5 s of production
+#     before the adapter wedges again (race between the replug and a
+#     concurrent household-load spike pushing the inverter hard). Waiting
+#     15 min to retry in that case leaves the inverter effectively off.
+#     So the first SHORT_ATTEMPTS replugs are spaced at SHORT_COOLDOWN_S
+#     (5 min — aggressive enough to retry quickly, slow enough not to
+#     thrash); after that budget, fall back to LONG_COOLDOWN_S (15 min)
+#     because if two successive replugs didn't hold, the real cause is
+#     probably not a transient USB glitch (inverter-side UVP, thermal
+#     lockout, etc.) and hammering the USB bus won't help.
+#   HEALTHY_RESET_S — if we've stayed not-wedged for this long, reset the
+#     consecutive-attempts counter. Means a legitimate intermittent issue
+#     a week later gets the aggressive short-cooldown treatment again,
+#     not the long cooldown. 2 min is long enough that a fake "5 s of
+#     working" doesn't count.
 #   COMMAND_W — minimum commanded demand before we trust the wedge signal.
-#     Below this the grid-follower isn't asking for much, and small
-#     commands legitimately don't show up on the battery monitor.
-#   DISCHARGE_W — when battery_power is more negative than this (i.e.
-#     discharging ≥ this many watts), the inverter is clearly drawing and we
-#     consider the system healthy regardless of the commanded value.
+#     Below this the grid-follower isn't asking for much, and small commands
+#     legitimately don't show up against battery-monitor noise.
+#   DISCHARGE_W — mismatch tolerance between observed battery_power and
+#     expected (= solar − commanded_dc). Wedged when observed exceeds
+#     expected by this many watts (i.e. battery charges ≥ DISCHARGE_W more
+#     than it should be, because our DC draw isn't showing up). On systems
+#     without PV this collapses to "battery isn't discharging by ≥ this many
+#     watts", the original semantics.
+#
+# During any cooldown the service keeps commanding full demand on RS-485
+# so the inverter picks up immediately whenever its own condition clears,
+# even without a successful replug.
 AUTO_RESET_STARTUP_DELAY_S = 30.0
-AUTO_RESET_COOLDOWN_S = 3600.0
+AUTO_RESET_SHORT_COOLDOWN_S = 300.0     # 5 min
+AUTO_RESET_LONG_COOLDOWN_S = 900.0      # 15 min
+AUTO_RESET_SHORT_ATTEMPTS = 2           # first N attempts at short cooldown
+AUTO_RESET_HEALTHY_RESET_S = 120.0      # 2 min of healthy ops resets the counter
 AUTO_RESET_COMMAND_THRESHOLD_W = 100
-AUTO_RESET_DISCHARGE_THRESHOLD_W = 50
+# Widened from 50 W to 200 W once real readings landed: the BMS (CAN) and
+# MPPT (VE.Direct) report battery_power and solar_power asynchronously, so
+# the "observed − expected" residual routinely swings ±60–100 W even when
+# nothing is wrong. Plus our INVERTER_EFFICIENCY constant is a point
+# estimate of a curve that shifts 3–5 percentage points with load. 200 W
+# keeps the detector sharp for real failures (a wedged inverter shows
+# residuals ≥ commanded_ac, typically 400+ W) while not flapping on noise.
+AUTO_RESET_DISCHARGE_THRESHOLD_W = 200
 
 
 def _mode_name(mode):
@@ -598,9 +635,12 @@ def _add_management_paths(svc, cfg, version_suffix='', firmware_version='unknown
     svc.add_path('/ProductName', 'Soyosource GTN')
     svc.add_path('/CustomName', cfg.custom_name, writeable=True)
     # vebus needs int here (systemcalc's dvcc delegate compares against
-    # VEBUS_FIRMWARE_REQUIRED, a string 'unknown' < int raises TypeError and
-    # crashes systemcalc). For pvinverter/inverter service types the default
-    # string is fine.
+    # VEBUS_FIRMWARE_REQUIRED = 0x422 (1058 decimal). A string 'unknown' < int
+    # raises TypeError and crashes systemcalc; an int below 0x422 passes the
+    # TypeError hurdle but fires /Dvcc/Alarms/FirmwareInsufficient (Victron
+    # error #48, "DVCC with incompatible firmware"). See create_vebus_service
+    # for the value we use. For pvinverter/inverter service types the default
+    # string is fine — they don't hit the dvcc check.
     svc.add_path('/FirmwareVersion', firmware_version)
     svc.add_path('/HardwareVersion', 'unknown')
     svc.add_path('/Serial', 'soyosource-%d' % cfg.device_instance)
@@ -615,11 +655,18 @@ def _add_management_paths(svc, cfg, version_suffix='', firmware_version='unknown
 
 
 def _add_mode_path(svc, mode_callback):
-    """Writable /Mode path. mode_callback(new_mode_int) -> bool accepts/rejects the write."""
+    """Writable /Mode path. mode_callback(new_mode_int) -> bool accepts/rejects the write.
+
+    /ModeIsAdjustable = 1 tells Remote Console / VRM / GUIv2 that /Mode is
+    actually writable. Without it the UI renders the Mode dialog but swallows
+    clicks — the "clicks don't do anything" symptom. Standard on real Multi
+    and Quattro installations; Victron's dummyinverter.py publishes it too.
+    """
     svc.add_path(
         '/Mode', MODE_ON, writeable=True,
         onchangecallback=lambda p, v: mode_callback(v),
     )
+    svc.add_path('/ModeIsAdjustable', 1)
 
 
 def create_vebus_service(bus, cfg, mode_callback):
@@ -638,10 +685,17 @@ def create_vebus_service(bus, cfg, mode_callback):
     essential-loads bus exists.
 
     Landmine mitigations:
-    - /FirmwareVersion published as int (469) — satisfies the dvcc delegate's
-      VEBUS_FIRMWARE_REQUIRED comparison that crashed us last time.
+    - /FirmwareVersion published as int 0x0500 (1280) — above
+      VEBUS_FIRMWARE_REQUIRED (0x422) so /Dvcc/Alarms/FirmwareInsufficient
+      stays clear. A string value 'unknown' crashes systemcalc with a
+      TypeError from the dvcc comparison; an int below 0x422 passes the
+      type check but triggers Victron error #48 ("DVCC with incompatible
+      firmware") in the UI.
     - /Hub4/* paths exposed as writable no-ops so ESS (hub-4) doesn't error
       when it tries to write grid setpoints to our non-existent Multi.
+    - /BatteryOperationalLimits/* paths exposed as writable no-ops. Once
+      firmware is above threshold dvcc writes these on every tick; without
+      receivers we'd get "path doesn't exist" warnings.
     - /Bms/AllowTo{Charge,Discharge} = None → BMS delegate treats us as
       "no vebus BMS", defers to the real BMS on the battery service.
     - ProductId kept at 0xA144 (our own) — doesn't match the Multi-BMS
@@ -652,7 +706,13 @@ def create_vebus_service(bus, cfg, mode_callback):
     service_name = 'com.victronenergy.vebus.soyosource_%d' % cfg.device_instance
     svc = VeDbusService(service_name, bus=bus, register=False)
 
-    _add_management_paths(svc, cfg, ' (vebus)', firmware_version=469)
+    # 0x0500 = 1280 — comfortably above VEBUS_FIRMWARE_REQUIRED = 0x422 (1058),
+    # displays as "v5.00" when the UI decodes it as hex-BCD
+    # ("%x.%02x" % (v>>8, v&0xFF)). Earlier we used 469 (decimal), which
+    # looks like it should be fine but 469 decimal = 0x1D5 in the integer
+    # comparison — below 0x422 — so dvcc fired FirmwareInsufficient (#48)
+    # on every tick. The hex/decimal confusion is the whole landmine.
+    _add_management_paths(svc, cfg, ' (vebus)', firmware_version=0x0500)
 
     _add_mode_path(svc, mode_callback)
 
@@ -721,6 +781,7 @@ def create_vebus_service(bus, cfg, mode_callback):
         svc.add_path('/Alarms/%s' % a, 0)
 
     _add_hub4_stubs(svc)
+    _add_bol_stubs(svc)
 
     return _register_with_retry(svc, service_name)
 
@@ -748,6 +809,32 @@ def _add_hub4_stubs(svc):
     # /Hub4/AssistantId: None → systemcalc's SystemState treats us as "no ESS
     # assistant installed on this Multi", avoids the ExternalControl branch.
     svc.add_path('/Hub4/AssistantId', None)
+
+
+def _add_bol_stubs(svc):
+    """
+    Expose /BatteryOperationalLimits/* as writable no-ops.
+
+    Once our /FirmwareVersion is above VEBUS_FIRMWARE_REQUIRED (0x422),
+    dvcc.py's update loop writes these paths on every tick via
+    set_value_async — see the BatteryOperationalLimits class in
+    /opt/victronenergy/dbus-systemcalc-py/delegates/dvcc.py. Without
+    receivers the writes fail silently on the bus, which can trigger
+    "path doesn't exist" warnings in systemcalc logs depending on the
+    velib_python version. Accepting them as no-ops keeps the log clean.
+
+    We don't act on these — we have no charger and our discharge rate is
+    driven by the grid-follower, not a DVCC setpoint.
+    """
+    def accept(path, value):
+        log.debug("BOL write to %s = %r (ignored)", path, value)
+        return True
+    for path in ('/BatteryOperationalLimits/MaxChargeVoltage',
+                 '/BatteryOperationalLimits/MaxChargeCurrent',
+                 '/BatteryOperationalLimits/MaxDischargeCurrent',
+                 '/BatteryOperationalLimits/BatteryLowVoltage'):
+        svc.add_path(path, None, writeable=True,
+                     onchangecallback=lambda p, v: accept(p, v))
 
 
 def create_inverter_service(bus, cfg, mode_callback):
@@ -911,20 +998,52 @@ class SoyosourceService:
         self.svc = create_service(self.bus, cfg, mode_callback=self._on_mode_write)
 
         self.last_demand = 0            # last demand we sent (watts)
+        # What we actually *believe* is reaching the grid — may differ from
+        # last_demand when the inverter is wedged/UVP-protected and refusing to
+        # produce despite our commands. Published on D-Bus so the UI doesn't
+        # show phantom load offsetting. RS-485 keeps getting last_demand so
+        # the inverter resumes immediately when it recovers. See
+        # _inverter_appears_wedged / _update_tick.
+        self.believed_ac_power = 0
+        self._wedge_logged = False       # so we only log the transition once
         self.energy_kwh = 0.0           # running forward energy
         self.last_energy_ts = time.time()
 
-        # Lazy-cached proxies for /Dc/Battery/{Voltage,Power} on
-        # com.victronenergy.system. Resolved on first read and refreshed
+        # Lazy-cached proxies for /Dc/Battery/{Voltage,Power} and /Dc/Pv/Power
+        # on com.victronenergy.system. Resolved on first read and refreshed
         # automatically on systemcalc restarts via follow_name_owner_changes=True.
+        # Solar power is read by the wedge detector so battery flow can be
+        # compared to the *expected* flow (solar − our DC draw), not just to
+        # zero. Without this, concurrent PV charging masks a healthy inverter
+        # as "wedged" because the battery is charging net-positive.
         self._battery_voltage_proxy = None
         self._battery_power_proxy = None
+        self._solar_power_proxy = None
 
-        # Auto-reset state (see _maybe_auto_reset). _service_start_ts gates the
-        # first check; _last_auto_reset_ts enforces the per-lifetime cooldown
-        # so we don't churn the adapter if the replug didn't help.
+        # Auto-reset state (see _maybe_auto_reset).
+        # _service_start_ts     : gates the first check (startup grace).
+        # _last_auto_reset_ts   : time of most recent replug, for cooldown.
+        # _consecutive_reset_attempts: progressive-backoff counter. First
+        #     AUTO_RESET_SHORT_ATTEMPTS attempts use the short cooldown;
+        #     afterwards the long cooldown.
+        # _last_wedge_ts        : last tick we observed wedge=True. The
+        #     counter resets to 0 after AUTO_RESET_HEALTHY_RESET_S of no
+        #     wedges, so a legitimate new problem later gets the aggressive
+        #     short-cooldown treatment and doesn't inherit the slow one.
         self._service_start_ts = time.time()
         self._last_auto_reset_ts = 0.0
+        self._consecutive_reset_attempts = 0
+        self._last_wedge_ts = 0.0
+
+        # Sticky wedge state for the case where the battery monitor briefly
+        # drops off D-Bus (systemcalc restart, BMS USB reconnect, etc). Without
+        # this, the publish path would flip back to "trust the command" during
+        # the dropout and re-inflate the UI by the full commanded demand — even
+        # when nothing about the inverter's physical state has changed. See
+        # _inverter_appears_wedged.
+        self._battery_power_seen = False
+        self._was_wedged = False
+        self._battery_dropout_logged = False
 
         # Diagnostics: 60s heartbeat + drift detector. Demand-change logs don't
         # show the steady-state wedge pattern (frame count, grid convergence),
@@ -1030,6 +1149,113 @@ class SoyosourceService:
             return float(raw)
         except (dbus.DBusException, TypeError, ValueError):
             return None
+
+    def _read_solar_power(self):
+        """
+        Read /Dc/Pv/Power from com.victronenergy.system.
+
+        Sign convention: positive = PV producing into DC bus. Aggregated by
+        systemcalc across all solarchargers; returns 0 on systems with no
+        MPPTs. Used by the wedge detector to subtract concurrent PV charging
+        from the expected battery flow.
+
+        Returns float on success, 0.0 on any error (treat missing solar as
+        "no PV", which reduces the wedge check back to the simple
+        "battery should be discharging" test).
+        """
+        if self._solar_power_proxy is None:
+            try:
+                self._solar_power_proxy = self.bus.get_object(
+                    'com.victronenergy.system', '/Dc/Pv/Power',
+                    follow_name_owner_changes=True)
+            except dbus.DBusException:
+                return 0.0
+        try:
+            raw = self._solar_power_proxy.GetValue(
+                dbus_interface='com.victronenergy.BusItem')
+            return float(raw)
+        except (dbus.DBusException, TypeError, ValueError):
+            return 0.0
+
+    def _inverter_appears_wedged(self):
+        """
+        Core wedge heuristic, shared by the publish path and the auto-reset
+        gate.
+
+        Returns True when all of the following hold:
+          1. We're in MODE_ON (Eco/Off don't count — Eco is intentional, Off
+             doesn't even TX).
+          2. Commanded demand ≥ AUTO_RESET_COMMAND_THRESHOLD_W (below this,
+             battery-monitor noise drowns the signal).
+          3. /Dc/Battery/Power is reachable OR was reachable before and
+             we have a recent verdict to stick with.
+          4. Observed battery power is at least AUTO_RESET_DISCHARGE_THRESHOLD_W
+             *higher* than expected (i.e. battery is charging more than it
+             should be, because our commanded DC draw isn't showing up).
+
+        Expected battery flow = solar_power − commanded_demand / efficiency.
+        Comparing against this, not against zero, is critical when PV is
+        active: if solar produces 1600 W and we command the inverter to
+        draw 450 W DC, the battery still charges at ~1150 W net. A
+        zero-based check ("battery not discharging") would false-positive
+        every sunny day — the earlier implementation did exactly that.
+
+        If /Dc/Pv/Power isn't available (no MPPTs on the system) the solar
+        term is 0 and the check collapses back to "battery should be
+        discharging at least ~commanded_dc − threshold W".
+
+        Covers all the ways the inverter can be "silent despite commanded
+        power": USB adapter wedge, Soyosource UVP, thermal protection, loose
+        RS-485 wiring, etc. Self-clears as soon as the inverter starts
+        actually pulling DC current again.
+
+        Sticky behaviour on BMS dropout: if the battery service briefly
+        disappears (systemcalc restart, JKBMS USB reconnect, etc), we
+        DON'T flip back to "trust the command" — that would re-inflate the
+        UI by 900 W the moment the BMS blinks, even though nothing about
+        the inverter's physical state changed. Instead we hold the last
+        verdict until a fresh read is available. Users with no battery
+        monitor at all (no D-Bus reading ever) fall back to the previous
+        behaviour: return False and trust the command.
+        """
+        if self.mode != MODE_ON:
+            return False
+        if self.last_demand < AUTO_RESET_COMMAND_THRESHOLD_W:
+            return False
+
+        bp = self._read_battery_power()
+        if bp is None:
+            if self._battery_power_seen:
+                # BMS was here before — stick with the last verdict. Log the
+                # transition once so the operator can correlate with BMS logs.
+                if not self._battery_dropout_logged:
+                    log.warning("Battery monitor unreachable; holding last "
+                                "wedge verdict (%s) until it returns.",
+                                'WEDGED' if self._was_wedged else 'ok')
+                    self._battery_dropout_logged = True
+                return self._was_wedged
+            # Never seen a BMS on this boot — user probably doesn't have one.
+            # Fall back to the original "trust the command" behaviour.
+            return False
+
+        # Fresh read: update state, log recovery if we'd been in a dropout.
+        self._battery_power_seen = True
+        if self._battery_dropout_logged:
+            log.info("Battery monitor back online; resuming live wedge "
+                     "detection (battery_power=%.1fW).", bp)
+            self._battery_dropout_logged = False
+
+        # Compute expected battery power: PV - (what we're drawing from DC).
+        # If PV covers our draw, the battery charges net-positive while the
+        # inverter is working correctly; the wedge signal is a mismatch of
+        # that expected flow, not a negative bp per se.
+        solar_w = self._read_solar_power()
+        commanded_dc_w = self.last_demand / INVERTER_EFFICIENCY
+        expected_bp = solar_w - commanded_dc_w
+
+        wedged = (bp - expected_bp) >= AUTO_RESET_DISCHARGE_THRESHOLD_W
+        self._was_wedged = wedged
+        return wedged
 
     def _estimate_dc(self, p_ac):
         """
@@ -1142,13 +1368,63 @@ class SoyosourceService:
                      _mode_name(self.mode), grid_str, self.last_demand, new_demand)
         self.last_demand = new_demand
 
+        # Decide what we *believe* is actually reaching the grid. We keep
+        # commanding last_demand on RS-485 (the inverter picks up instantly
+        # when its own condition clears), but publish 0 on D-Bus while we
+        # have clear evidence the inverter isn't producing (battery flow
+        # doesn't reflect our commanded DC draw, accounting for concurrent
+        # PV charging). Without this, ConsumptionOnInput and DcSystemPower
+        # both get inflated by phantom 900 W.
+        wedge = self._inverter_appears_wedged()
+        if wedge and not self._wedge_logged:
+            bp = self._read_battery_power()
+            solar = self._read_solar_power()
+            expected = solar - (new_demand / INVERTER_EFFICIENCY)
+            log.warning(
+                "Inverter appears wedged (commanded=%dW; battery=%.0fW, "
+                "solar=%.0fW, expected_battery=%.0fW, mismatch=%.0fW) — "
+                "suppressing D-Bus production paths. RS-485 frames continue "
+                "at %dW so recovery is immediate when the condition clears "
+                "(USB replug / UVP release / etc.).",
+                new_demand,
+                bp if bp is not None else float('nan'),
+                solar, expected,
+                (bp - expected) if bp is not None else float('nan'),
+                new_demand)
+            self._wedge_logged = True
+        elif not wedge and self._wedge_logged:
+            log.info("Inverter drawing from DC again — resuming normal D-Bus "
+                     "production paths")
+            self._wedge_logged = False
+        self.believed_ac_power = 0 if wedge else new_demand
+
+        # Progressive-backoff bookkeeping. While wedged, advance
+        # _last_wedge_ts so the timer for "healthy long enough to reset
+        # attempts counter" only starts once wedging fully stops.
+        if wedge:
+            self._last_wedge_ts = now
+        elif self._consecutive_reset_attempts > 0:
+            # Not wedged. If we've never been wedged this session,
+            # healthy-since is the service start; otherwise the last
+            # wedge tick. Either way, check if it's been long enough.
+            healthy_since = (self._last_wedge_ts if self._last_wedge_ts > 0
+                             else self._service_start_ts)
+            if now - healthy_since >= AUTO_RESET_HEALTHY_RESET_S:
+                log.info("Inverter healthy for %.0fs — clearing "
+                         "consecutive auto-replug counter (was %d). "
+                         "Next wedge will retry at short cooldown.",
+                         AUTO_RESET_HEALTHY_RESET_S,
+                         self._consecutive_reset_attempts)
+                self._consecutive_reset_attempts = 0
+
         self._heartbeat(now, grid)
         self._check_drift(grid)
         self._maybe_auto_reset()
 
-        # Integrate commanded energy (rough — inverter reports ~98% of command)
+        # Integrate believed energy — only energy we think actually reached
+        # the grid counts. During a wedge this stays flat.
         dt = now - self.last_energy_ts
-        self.energy_kwh += (self.last_demand * dt) / 3600000.0
+        self.energy_kwh += (self.believed_ac_power * dt) / 3600000.0
         self.last_energy_ts = now
 
         # Try to parse any status response the inverter may have sent
@@ -1244,64 +1520,76 @@ class SoyosourceService:
     # --------------------------------------------------------- Auto USB replug
     def _maybe_auto_reset(self):
         """
-        Recover from the cold-boot USB wedge automatically.
+        Attempt an automatic USB replug when the inverter appears wedged.
 
-        Symptom we're catching: pyserial reports writes succeeding, the TX
-        LED on the FT232R flashes, but the inverter's display stays at 0 W
-        and the battery isn't actually discharging. The user verified that a
-        physical replug of the USB adapter always recovers it; we do the
-        same thing in software by unbinding and rebinding the ftdi_sio
-        driver (see usb_reset_adapter).
+        Wedge detection lives in _inverter_appears_wedged (shared with the
+        publish-suppression path, so the UI and the auto-reset use exactly
+        the same signal).
 
-        Detection relies on the battery monitor, which is more reliable
-        than the grid meter for this purpose — the grid can legitimately
-        read zero for a few seconds when a household load cycles off, but
-        the battery state tracks physical power flow directly. We consider
-        it a wedge iff:
+        Extra timing gates on top of the wedge predicate:
+          - uptime ≥ AUTO_RESET_STARTUP_DELAY_S so early-startup transients
+            don't trigger a replug;
+          - time since last attempt ≥ cooldown, where the cooldown follows
+            a progressive backoff: the first AUTO_RESET_SHORT_ATTEMPTS
+            replugs are spaced by AUTO_RESET_SHORT_COOLDOWN_S (5 min), then
+            we fall back to AUTO_RESET_LONG_COOLDOWN_S (15 min). Rationale:
+            we've seen the first replug catch only ~5 s of production
+            before the adapter wedges again (race with a load spike). A
+            second quick attempt usually fixes that; if two in a row don't
+            hold, the cause is probably not a USB glitch and hammering
+            won't help.
 
-          1. Service has been running ≥ AUTO_RESET_STARTUP_DELAY_S
-             (give the control loop time to ramp up and the battery
-             monitor time to respond),
-          2. We're in MODE_ON (Eco/Off are ignored; Off doesn't even TX
-             and Eco is a user override),
-          3. Commanded demand ≥ AUTO_RESET_COMMAND_THRESHOLD_W (below
-             this the signal is lost in battery-monitor noise),
-          4. Battery is NOT discharging by at least
-             AUTO_RESET_DISCHARGE_THRESHOLD_W (if it IS, the inverter is
-             clearly drawing DC power — not wedged),
-          5. Last reset attempt was ≥ AUTO_RESET_COOLDOWN_S ago
-             (prevents a churn if the replug itself didn't help).
+        The counter resets to 0 after AUTO_RESET_HEALTHY_RESET_S of
+        no-wedge operation (see _update_tick — `_last_wedge_ts`), so a
+        legitimate new problem hours later gets the aggressive
+        short-cooldown treatment again.
 
-        One-shot behaviour. If the replug doesn't restore production, the
-        drift detector will still log DRIFT warnings for visibility, and
-        the user can intervene manually.
+        The replug is equivalent to a physical unplug/replug of the FT232R:
+        the kernel tears down the usb-serial binding, waits a second, and
+        re-enumerates. The by-id symlink comes back with the same tty name,
+        serial-starter lock stays valid, and the next TX tick reopens the
+        port. See usb_reset_adapter for the mechanics.
+
+        If the replug doesn't restore production (e.g. because the actual
+        cause is UVP), the publish path already shows 0 on the UI and the
+        RS-485 TX keeps commanding full demand, so the moment the inverter's
+        own condition clears it picks up instantly.
         """
-        if self.mode != MODE_ON:
-            return
-        if self.last_demand < AUTO_RESET_COMMAND_THRESHOLD_W:
+        if not self._inverter_appears_wedged():
             return
 
         now = time.time()
-        uptime = now - self._service_start_ts
-        if uptime < AUTO_RESET_STARTUP_DELAY_S:
-            return
-        if now - self._last_auto_reset_ts < AUTO_RESET_COOLDOWN_S:
+        if now - self._service_start_ts < AUTO_RESET_STARTUP_DELAY_S:
             return
 
-        bp = self._read_battery_power()
-        if bp is None:
-            # No battery monitor reachable; we have no way to tell. Let the
-            # drift detector (grid-based) pick it up instead.
-            return
-        if bp < -AUTO_RESET_DISCHARGE_THRESHOLD_W:
-            # Healthy: inverter is drawing from battery.
+        cooldown = (AUTO_RESET_SHORT_COOLDOWN_S
+                    if self._consecutive_reset_attempts < AUTO_RESET_SHORT_ATTEMPTS
+                    else AUTO_RESET_LONG_COOLDOWN_S)
+        if now - self._last_auto_reset_ts < cooldown:
             return
 
-        log.warning("USB wedge suspected: mode=On commanded=%dW but "
-                    "battery_power=%.1fW (not discharging). Attempting soft "
-                    "replug of the FT232R (unbind+rebind ftdi_sio).",
-                    self.last_demand, bp)
+        bp = self._read_battery_power()  # for log context only
+        solar = self._read_solar_power()
+        expected = solar - (self.last_demand / INVERTER_EFFICIENCY)
+        log.warning("Wedge suspected: mode=On commanded=%dW; battery=%.1fW "
+                    "solar=%.1fW expected_battery=%.1fW mismatch=%.1fW "
+                    "(DC draw isn't showing up). Attempting soft replug of "
+                    "the FT232R (unbind+rebind ftdi_sio). Attempt #%d; next "
+                    "cooldown %.0fs (%s).",
+                    self.last_demand,
+                    bp if bp is not None else float('nan'),
+                    solar, expected,
+                    (bp - expected) if bp is not None else float('nan'),
+                    self._consecutive_reset_attempts + 1,
+                    (AUTO_RESET_SHORT_COOLDOWN_S
+                     if (self._consecutive_reset_attempts + 1)
+                         < AUTO_RESET_SHORT_ATTEMPTS
+                     else AUTO_RESET_LONG_COOLDOWN_S),
+                    ('short' if (self._consecutive_reset_attempts + 1)
+                         < AUTO_RESET_SHORT_ATTEMPTS
+                     else 'long'))
         self._last_auto_reset_ts = now
+        self._consecutive_reset_attempts += 1
 
         # Close pyserial so the kernel can cleanly release the tty. The
         # serial-starter lock stays in place (symlink is tty-name-keyed and
@@ -1318,7 +1606,12 @@ class SoyosourceService:
 
     # ------------------------------------------------------------ D-Bus publish
     def _publish(self, status):
-        p = self.last_demand
+        # believed_ac_power, NOT last_demand. During a wedge this is 0 and
+        # all downstream publish paths (ActiveIn, Out, Dc/0, State, energy)
+        # fall through to zero as well, so the UI shows reality instead of
+        # phantom production. The RS-485 TX loop still sends last_demand
+        # unchanged — that's orthogonal.
+        p = self.believed_ac_power
         phase = self.cfg.phase
 
         # Use measured AC voltage if the inverter answered a status query,

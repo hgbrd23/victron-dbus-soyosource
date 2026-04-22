@@ -159,7 +159,9 @@ sync, first-run-only semantics) for something that in practice gets set once
 and left alone. `config.ini` is now the single source of truth.
 
 The only runtime switch is the **Inverter mode** (On / Eco / Off), documented
-below.
+below. With `ServiceType = vebus` (the default) it's a clickable radio
+dialog on the GUIv2 Inverter/Charger tile and in VRM; on other service
+types it's a dbus/MQTT/Node-RED write.
 
 ### `config.ini`
 
@@ -184,36 +186,61 @@ below.
 
 ### Inverter mode — On / Eco / Off
 
-The service exposes a writable `/Mode` path with three values. This is the
-only runtime control — write it and the control loop responds immediately.
+The service exposes a writable `/Mode` path. This is the only runtime
+control — write it and the control loop responds immediately.
 
-With `ServiceType = pvinverter` (default), GUIv2 does **not** render a Mode
-dialog on the device page (that's a Multi/Inverter-tile UI). Flip the mode
-over D-Bus, MQTT, or Node-RED instead:
+#### From the GUI (ServiceType=vebus, default)
+
+GUIv2 (local HDMI or Remote Console) and VRM both render the native
+Inverter/Charger Mode dialog on our service. It shows the four standard
+Victron Multi modes:
+
+| Dialog label | Writes `/Mode` to | What our service does |
+|---|---|---|
+| **On** | `3` | **Rejected** — our service only invert/discharges, never charges. Clicking this has no effect. |
+| **Charger only** | `1` | **Rejected** — we have no charger. Clicking this has no effect. |
+| **Inverter only** | `2` | ✅ Our *On* mode — normal grid-following control loop. This is the "on" button for a Soyosource. |
+| **Off** | `4` | ✅ *Off* — stop transmitting; inverter drops to 0 W within 10 s. |
+
+In short: **click "Inverter only" to turn it on, "Off" to turn it off**.
+"On" and "Charger only" are rejected because they imply a charger we don't
+have. The dialog reflects our live state — once we're running, the
+"Inverter only" radio is filled and the tile badge reads "Inverting".
+
+The native dialog is interactive because we publish `/ModeIsAdjustable = 1`;
+without that path both VRM and Remote Console render the dialog but
+silently swallow writes (the symptom was confusing enough to diagnose that
+it's worth flagging here). The "Eco" fixed-demand mode is our addition
+(value `5`) and is *not* in the native dialog — use dbus/MQTT/Node-RED to
+reach it.
+
+#### From D-Bus / MQTT / Node-RED
+
+Works on every `ServiceType`; only the service name changes
+(`com.victronenergy.<type>.soyosource_<N>`):
 
 ```bash
-# On  (normal grid-following)
-dbus -y com.victronenergy.pvinverter.soyosource_41 /Mode SetValue 2
-# Eco (fixed EcoPowerDemand watts)
-dbus -y com.victronenergy.pvinverter.soyosource_41 /Mode SetValue 5
-# Off (stop TX, inverter auto-offs)
-dbus -y com.victronenergy.pvinverter.soyosource_41 /Mode SetValue 4
+# On  (normal grid-following — "Inverter only" in the GUI)
+dbus -y com.victronenergy.vebus.soyosource_41 /Mode SetValue 2
+# Eco (fixed EcoPowerDemand watts — not exposed in the native dialog)
+dbus -y com.victronenergy.vebus.soyosource_41 /Mode SetValue 5
+# Off (stop TX, inverter auto-offs — "Off" in the GUI)
+dbus -y com.victronenergy.vebus.soyosource_41 /Mode SetValue 4
 ```
 
-Switch to `ServiceType = inverter` if you want the native GUIv2 dialog (at
-the cost of wrong consumption accounting — see the config table above).
+#### Mode reference
 
-| Mode | D-Bus value | Behaviour |
-|---|---|---|
-| **On** | `2` | Normal grid-following control loop. Reads the grid meter (per `TrackPhase`) and drives the inverter so the tracked value settles at `~TargetGridW`. This is the default on startup. |
-| **Eco** | `5` | Fixed-output mode. Sends `EcoPowerDemand` watts (default 360 W) continuously, regardless of grid readings. Useful for scheduled fixed-rate discharge (e.g. Node-RED at night) without any grid-meter dependency. |
-| **Off** | `4` | Silent. The service stops transmitting on RS-485 entirely; the inverter auto-offs after ~10 s. A short burst of 0 W frames is sent on the transition so the inverter drops to zero immediately. |
+| Our mode | `/Mode` value | GUI label | Behaviour |
+|---|---|---|---|
+| **On**  | `2` | "Inverter only" | Normal grid-following control loop. Reads the grid meter (per `TrackPhase`) and drives the inverter so the tracked value settles at `~TargetGridW`. This is the default on startup. |
+| **Eco** | `5` | *(not in dialog)* | Fixed-output mode. Sends `EcoPowerDemand` watts (default 360 W) continuously, regardless of grid readings. Useful for scheduled fixed-rate discharge (e.g. Node-RED at night) without any grid-meter dependency. |
+| **Off** | `4` | "Off" | Silent. The service stops transmitting on RS-485 entirely; the inverter auto-offs after ~10 s. A short burst of 0 W frames is sent on the transition so the inverter drops to zero immediately. |
 
 The mode is **not persisted** — a service restart always comes back up in
-`On`. If you want the inverter genuinely off across reboots, stop the service
-(`svc -d /service/dbus-soyosource`) instead.
+`On`. If you want the inverter genuinely off across reboots, stop the
+service (`svc -d /service/dbus-soyosource`) instead.
 
-![GUIv2 Inverter mode dialog showing the On / Eco / Off radio options on the Soyosource GTN device page — only rendered when ServiceType=inverter](img/inverter-mode.png)
+![GUIv2 Inverter mode dialog showing the On / Charger only / Inverter only / Off radio options on the Soyosource GTN Inverter/Charger tile. "Inverter only" is our On mode; "Off" stops the service.](img/inverter-mode.png)
 
 ### How the control loop works (On mode)
 
@@ -253,22 +280,27 @@ frames before exiting.
 * **Service log** — `tail -F /var/log/dbus-soyosource/current` shows every
   demand change, e.g. `mode=On grid=156.4W demand 80 -> 175`.
 
-* **GUIv2** — `http://<gx-ip>/gui-v2/` should show the Soyosource's
-  production folded into the "PV" tile (or, with `ServiceType=inverter`,
-  the "Inverter / Charger" tile as "Inverting"). Under **Settings →
-  Devices** you'll find a `Soyosource GTN` entry showing the current
-  output power:
+* **GUIv2** — `http://<gx-ip>/gui-v2/` should show the Soyosource in the
+  **Inverter / Charger** tile with the "Inverting" badge (default
+  `ServiceType=vebus`). With `ServiceType=pvinverter` it folds into the
+  "PV" / "Solar yield" tile instead. Under **Settings → Devices** you'll
+  find a `Soyosource GTN` entry showing the current output power:
 
   ![VenusOS Settings → Devices list with Soyosource GTN producing 457 W alongside the BMS and Shelly 3EM grid meter](img/device-list.png)
 
-  With `ServiceType=inverter`, the device detail page shows an AC Out row
-  and the **Inverter mode** switch (On / Eco / Off — see above):
+  With the default `ServiceType=vebus`, the Inverter/Charger tile and
+  device page show the native Mode dialog (On / Charger only / Inverter
+  only / Off — click "Inverter only" to turn on; see the *Inverter mode*
+  section above for the mapping). The state badge reads "Inverting" when
+  we're producing.
 
   ![Soyosource GTN device page with Mode=On, State=Inverting, AC Out=230 V / 2.1 A / 480 W](img/device-page.png)
 
-  With `ServiceType=pvinverter` (default), the device page shows the PV
-  production values (L1 voltage, current, power, forward energy) without
-  a Mode switch.
+  With `ServiceType=pvinverter`, the device page shows PV production
+  values (L1 voltage, current, power, forward energy) without a Mode
+  switch — use dbus/MQTT/Node-RED. With `ServiceType=inverter`, a
+  simpler On/Eco/Off dialog is shown but the output is mis-attributed
+  to Essential Loads.
 
 ## Known limitations
 
@@ -278,14 +310,21 @@ frames before exiting.
   `/Dc/0/*` and `/Temperature` on the D-Bus service stay empty. We have no
   way to detect inverter faults from the bus — only from the LCD.
 
-* **Mode dialog only under `ServiceType=inverter`.** With the default
-  `pvinverter`, GUIv2 doesn't render a Mode switch on the device page —
-  flip modes via `dbus` / MQTT / Node-RED instead (see the *Inverter mode*
-  section above). `pvinverter` is the default because it gives correct
-  Total-Consumption accounting; `inverter` double-counts the Soyosource
-  output as Essential Loads. `vebus` would give both correct accounting
-  and the Mode switch but crashes `dbus-systemcalc-py` on non-Multiplus
-  systems — see CLAUDE.md.
+* **Standard Multi dialog, non-obvious labels.** Under the default
+  `ServiceType = vebus` the GUIv2 / VRM Mode dialog shows the standard
+  Victron Multi options ("On", "Charger only", "Inverter only", "Off").
+  Because we have no charger, only "Inverter only" (= our *On*) and
+  "Off" do anything — "On" (which implies charger+inverter) and
+  "Charger only" are silently rejected. The *Inverter mode* section
+  above explains the mapping. Our Eco mode (fixed `EcoPowerDemand` W) is
+  *not* in the native dialog — reach it via dbus/MQTT/Node-RED.
+
+* **`pvinverter` and `inverter` service types have no native Mode
+  dialog.** `pvinverter` doesn't render one at all; `inverter` shows a
+  simpler dialog but mis-attributes the output to Essential Loads. Stick
+  with the `vebus` default unless you have a real Multiplus on the same
+  system (in which case `pvinverter` avoids the `/VebusService`
+  collision).
 
 * **Single-phase only.** The service follows one phase of the grid meter.
   Multi-phase setups need one service instance per inverter (not yet
@@ -309,6 +348,115 @@ frames before exiting.
 | `restart.sh` | Sends SIGTERM to the running service; daemontools restarts it. |
 | `uninstall.sh` | Removes the symlink and stops the service. |
 | `CLAUDE.md` | Engineering notes — protocol details, gotchas, design decisions. |
+| `local-ui-setup.sh` | Optional — fixes the HDMI GUI + touchscreen on Raspberry Pi after a Venus OS update. Unrelated to the Soyosource service itself; see next section. |
+
+## Local HDMI GUI on Raspberry Pi (Venus OS 3.60–3.66)
+
+Unrelated to the inverter service, but in the same code base because it
+bites on the same hardware. If you run Venus OS on a Raspberry Pi with an
+HDMI panel + USB touchscreen, the local UI has two problems as of
+Venus OS 3.60–3.66:
+
+1. **HDMI shows only the console** — the image ships with
+   `/etc/venus/headless` present, and `start-gui.sh` checks for that file
+   to decide between offscreen and framebuffer rendering. This is
+   [official behaviour](https://github.com/victronenergy/venus/wiki/raspberrypi-install-venus-image)
+   until Venus OS 3.70 (which is dropping the check).
+
+2. **GUI loads to a blank screen** (the community-reported ["GUI v1
+   empty / GUI v2 black"](https://community.victronenergy.com/t/bug-gui-v1-empty-and-gui-v2-black-on-cerbo-gx-raspberry-pi-since-venus-os-3-60-3-64/44302)
+   bug). Root cause isolated here: six battery-related QML files in
+   `/opt/victronenergy/gui/qml/` still contain `import QtQuick 1.1`, but
+   the `gui` binary in 3.60+ is Qt6-linked and Qt6 has no QtQuick 1.x
+   module. The broken import cascades through `PageMain → PageBattery`
+   and the whole QML tree fails to load — visible in
+   `/var/log/gui/current` as `"module QtQuick version 1.1 is not
+   installed"` followed by `"loading QML files failed"`. No one has
+   published the specific files; the fix is a one-line sed on each:
+
+   ```
+   PageBattery.qml
+   PageBatteryCellVoltages.qml
+   PageBatteryParameters.qml
+   PageBatterySettings.qml
+   PageBatterySetup.qml
+   PageLynxIonIo.qml
+   ```
+
+`local-ui-setup.sh` handles both in an idempotent, update-proof way:
+
+```bash
+# Copy the script to /data (survives OS updates; /opt and /etc don't)
+ssh root@VENUS_IP mkdir -p /data/local-ui
+scp local-ui-setup.sh root@VENUS_IP:/data/local-ui/setup.sh
+ssh root@VENUS_IP chmod +x /data/local-ui/setup.sh
+
+# Run it once
+ssh root@VENUS_IP bash /data/local-ui/setup.sh
+
+# Make it re-apply after future OS updates: add one line to rc.local
+ssh root@VENUS_IP "grep -q local-ui/setup.sh /data/rc.local || \
+    echo 'bash /data/local-ui/setup.sh' >> /data/rc.local"
+```
+
+The script:
+- Remounts rootfs read-write (VenusOS ships it read-only).
+- Deletes `/etc/venus/headless`.
+- sed-patches the six battery QML files from `import QtQuick 1.1` to
+  `import QtQuick 2`.
+- Sends `svc -t /service/gui` so the fixes take effect without a reboot.
+
+### HDMI resolution and touchscreen coverage
+
+If the GUI shows up after the script runs but only fills **part of your
+panel** (and touch only works in that part), the Raspberry Pi firmware
+has auto-picked the wrong HDMI mode — a common symptom is
+`bcm2708_fb.fbwidth=656` in `dmesg` instead of your panel's native
+width. The fix is to tell the firmware the exact mode via
+`/u-boot/config.txt`; this file lives on the FAT boot partition and
+survives OS updates.
+
+Example for a 1024×600 generic 7″ HDMI panel
+(from [Victron's wiki](https://github.com/victronenergy/venus/wiki/raspberrypi-install-venus-image)):
+
+```ini
+hdmi_force_hotplug=1
+hdmi_group=2
+hdmi_mode=87
+hdmi_cvt=1024 600 60 6 0 0 0
+disable_overscan=1
+```
+
+`hdmi_cvt` format is `<width> <height> <framerate> <aspect> <margins> <interlace> <rb>`.
+The `aspect` code picks the CVT timing family: `1=4:3`, `2=14:9`, `3=16:9`,
+`4=5:4`, `5=16:10`, `6=15:9`. 1024×600 is ≈15:9 (1.707:1), so aspect=6.
+Using the wrong aspect code doesn't distort the output — the panel gets
+its native pixels either way — but it shifts the CVT-computed pixel clock
+and some panels are picky, so stick with the closest match.
+
+Other common panels:
+
+| Panel | config.txt |
+|---|---|
+| 800×480 (7″, ≈15:9) | `hdmi_cvt=800 480 60 6 0 0 0` (group=2, mode=87) |
+| 1024×600 (7″, ≈15:9) | `hdmi_cvt=1024 600 60 6 0 0 0` (group=2, mode=87) |
+| 1280×800 (8″, 16:10) | `hdmi_cvt=1280 800 60 5 0 0 0` (group=2, mode=87) |
+| 1920×1080 (HD) | `hdmi_group=1, hdmi_mode=16` |
+
+After editing `/u-boot/config.txt`, reboot. `dmesg | grep fb` should
+then show your target width/height; Qt will report the same in
+`/var/log/gui/current` on the `Screen: WxH` line.
+
+### Alternative: kwindrem/RpiDisplaySetup
+
+For an all-in-one tool (including interactive mode selection, screensaver
+dimming, rotation, and `ts_calibrate` for touchscreens whose coordinates
+don't map linearly), Victron's wiki recommends
+[kwindrem/RpiDisplaySetup](https://github.com/kwindrem/RpiDisplaySetup)
+— heavier (depends on `SetupHelper` as well), but handles more of the
+corner cases automatically. It does *not* patch the QtQuick 1.1 QML
+files; if you install it on 3.60–3.66 you'll still need
+`local-ui-setup.sh` (or the equivalent sed) to get past the blank screen.
 
 ## Credits
 
