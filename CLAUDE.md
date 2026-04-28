@@ -218,10 +218,14 @@ demand ≥ 100 W, `/Dc/Battery/Power` reachable, and observed battery power
 exceeds the *expected* battery power by ≥ 50 W, where
 `expected_bp = solar_w − commanded_dc` (solar from `/Dc/Pv/Power` on
 `com.victronenergy.system`, commanded_dc = commanded_ac / efficiency).
-Covers every "silent despite command" failure mode — cold-boot USB wedge,
-Soyosource UVP lockout, thermal protection, loose RS-485 wiring — because
-they all manifest the same way: our DC draw doesn't show up in the battery
-flow. Comparing against expected-not-zero is essential when PV is active:
+Catches every "silent despite command" failure mode in the same
+"observed battery flow doesn't match expectation" shape, regardless of
+which link is actually broken (USB adapter, RS-485 wiring, inverter
+MCU). In practice on this hardware the dominant mechanism is an
+FT232R/CBUS/TXDEN hang in our adapter — see the "USB wedge" gotcha
+below. The inverter itself has been a bystander; power-cycling the
+Soyosource at the AC breaker does not clear a wedge, but replugging
+the USB adapter does. Comparing against expected-not-zero is essential when PV is active:
 if solar produces 1600 W and we command 450 W DC, a healthy inverter
 leaves the battery charging at ~1150 W net — the original zero-based check
 ("battery not discharging by 50 W") painted the UI tile "Off" all
@@ -241,22 +245,24 @@ tick and drives two behaviours:
    uptime ≥ 30 s AND time since last attempt ≥ cooldown, do one
    `usb_reset_adapter()` cycle. Cooldown schedule:
 
-   - Attempts 1–2: **5 min** (`AUTO_RESET_SHORT_COOLDOWN_S`)
-   - Attempts 3+: **15 min** (`AUTO_RESET_LONG_COOLDOWN_S`)
+   - Attempts 1–4: **2 min** (`AUTO_RESET_SHORT_COOLDOWN_S`)
+   - Attempts 5+: **15 min** (`AUTO_RESET_LONG_COOLDOWN_S`)
 
    The counter resets to 0 after `AUTO_RESET_HEALTHY_RESET_S = 120 s` of
    wedge-free operation, so an unrelated problem a day later starts at
    attempt 1 again, not at "long cooldown from last time".
 
-   Rationale: observed on this rig at least once — first replug succeeded
-   in the kernel (`USB reset complete`), inverter produced for ~5 s, then
-   wedged again. The 15 min wait blocked any recovery for the rest of the
-   load-spike window. Second replug a few minutes later fixed it
-   permanently. So the first two attempts are cheap enough to try at 5
-   min; if neither holds, the cause is probably not a transient USB glitch
-   (inverter thermal / internal fault / UVP — no amount of replugging
-   raises battery voltage) and we back off to 15 min to avoid adapter
-   thrash.
+   Rationale: during sunny high-load windows we've seen the FT232R glitch
+   and recover repeatedly — up to 5 wedge/recover cycles in 8 minutes,
+   with most wedges lasting only ~5–10 s before a replug or self-heal
+   clears them. A single 15-min cooldown during that kind of stretch
+   effectively shuts the inverter off for the rest of the event. So the
+   first four attempts are spaced at 2 min (long enough to let ftdi_sio
+   fully re-enumerate and to distinguish "brief glitch" from "genuinely
+   stuck", but inside the load-window). After four replugs don't hold,
+   we back off to 15 min — the RS-485 command keeps going out at full
+   demand during the cooldown, so the inverter picks up the moment the
+   adapter un-sticks on its own.
 
    The RS-485 command keeps going at full demand during every cooldown
    regardless of attempt count, so when the inverter's own condition
@@ -299,26 +305,49 @@ useful when there's no battery monitor on the system.
   service handles the missing telemetry gracefully — `/Temperature` stays
   empty; `/Dc/0/{Voltage,Current,Power}` are *estimated* (see next gotcha).
 
-- **Cold-boot USB wedge: TX LED flashes, no bytes on the wire.** Reproducible
-  on this setup (Pi 2, DSD TECH SH-U11F on a USB hub): after a VenusOS cold
-  boot, pyserial opens fine and every `write()` returns success, but the
-  inverter stays at 0 W and the battery doesn't discharge. Physical
-  unplug+replug of the USB adapter recovers it reliably. The fix is to do
-  the same thing in software: write the USB interface name (e.g.
-  `1-1.3.1:1.0`) to `/sys/bus/usb/drivers/ftdi_sio/unbind`, wait 1 s, then
-  the same name to `.../bind`. The tty comes back with the same name
-  (serial-starter lock stays valid) and the by-id symlink also resolves to
-  the same tty — our config doesn't need to know or care about the
-  underlying tty number. `usb_reset_adapter()` implements the sequence;
-  `_maybe_auto_reset()` triggers it once per hour when the battery monitor
-  reports ≥ -50 W (i.e. not discharging) despite commanded demand ≥ 100 W,
-  after an initial 30 s settling window at startup. Needs
-  `/Dc/Battery/Power` on `com.victronenergy.system` (i.e. a battery monitor
-  has to be present) — without it the wedge is only visible via the grid-
-  based drift detector and the user has to intervene. Root cause of the
-  wedge itself is unknown; likely either the FT232R's internal state after
-  a warm-boot of the Pi or a USB enumeration race — either way the replug
-  fixes it and we don't need to dig further.
+- **USB wedge: TX LED flashes, no bytes on the wire.** Reproducible on
+  this setup (Pi 2, DSD TECH SH-U11F on a USB hub). First seen after a
+  VenusOS cold boot, but also happens intermittently during normal
+  operation — often correlated with inverter load spikes. Symptoms:
+  pyserial opens fine, every `write()` returns success, TX LED on the
+  adapter blinks at the expected 2 Hz, but the inverter stays at 0 W and
+  the battery doesn't discharge. Physical unplug+replug of the USB
+  adapter recovers it reliably.
+
+  **Root cause (diagnosed 2026-04-23):** it's the FT232R in our adapter,
+  not the Soyosource. The SH-U11F architecture is FT232R → SP3490, with
+  CBUS2 on the FT232R programmed as TXDEN in EEPROM to drive the SP3490's
+  DE (Driver Enable) pin. When the FT232R's UART state machine or CBUS
+  logic gets stuck, bytes still clock out to the UART (so `write()` and
+  the USB-side TX LED both look healthy), but DE never asserts, so the
+  SP3490 stays in receive mode and the A+/B− pair sits at idle. The
+  Soyosource sees silence and after ~10 s of no frames goes to 0 W — its
+  failsafe, not a latched fault. Conclusive evidence: **power-cycling
+  the Soyosource at the AC breaker does NOT clear the wedge**. Only a
+  USB device reset of the adapter does (which forces the FT232R to
+  re-read its EEPROM and re-initialise CBUS/UART from scratch).
+
+  **Fix:** write the USB interface name (e.g. `1-1.3.1:1.0`) to
+  `/sys/bus/usb/drivers/ftdi_sio/unbind`, wait 1 s, then the same name
+  to `.../bind`. The tty comes back with the same name (serial-starter
+  lock stays valid) and the by-id symlink also resolves to the same
+  tty — our config doesn't need to know or care about the underlying
+  tty number. Plain pyserial `close()` + `open()` does NOT work because
+  it doesn't trigger a USB device reset; the FT232R keeps its stuck
+  state. `usb_reset_adapter()` implements the unbind/bind sequence.
+
+  **Permanent fix:** swap to an adapter with hardware auto-direction
+  (anything with a `MAX13487E`/`ADM2587E` or an integrated R/W detector
+  that doesn't depend on the USB-serial chip's internal state). That
+  whole failure class goes away. Our auto-replug is an operational
+  mitigation, not a true fix.
+
+  `_maybe_auto_reset()` triggers the replug automatically; see the
+  "Wedge handling" section above for the predicate and the progressive-
+  backoff schedule. Needs `/Dc/Battery/Power` on `com.victronenergy.system`
+  (i.e. a battery monitor has to be present) — without it the wedge is
+  only visible via the grid-based drift detector and the user has to
+  intervene manually.
 
 - **Missing `/Dc/0/*` on vebus/inverter services inflates "DC Loads" in Total
   Consumption.** systemcalc computes `vebuspower = V * I` per vebus service

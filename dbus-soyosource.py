@@ -73,16 +73,19 @@ FALLBACK_BATTERY_VOLTAGE = 52.0
 #     the grid-meter refresh + inverter spin-up.
 #   SHORT_COOLDOWN_S / LONG_COOLDOWN_S / SHORT_ATTEMPTS — progressive
 #     backoff for consecutive replug attempts. Observed pattern on Pi 2 +
-#     FT232R: the first auto-replug sometimes gets only ~5 s of production
-#     before the adapter wedges again (race between the replug and a
-#     concurrent household-load spike pushing the inverter hard). Waiting
-#     15 min to retry in that case leaves the inverter effectively off.
-#     So the first SHORT_ATTEMPTS replugs are spaced at SHORT_COOLDOWN_S
-#     (5 min — aggressive enough to retry quickly, slow enough not to
-#     thrash); after that budget, fall back to LONG_COOLDOWN_S (15 min)
-#     because if two successive replugs didn't hold, the real cause is
-#     probably not a transient USB glitch (inverter-side UVP, thermal
-#     lockout, etc.) and hammering the USB bus won't help.
+#     FT232R: during sunny high-load windows the FT232R can wedge and
+#     recover multiple times in quick succession (minutes between
+#     events). A single replug often gets the adapter going again for
+#     only ~5 s before the next glitch. So the first SHORT_ATTEMPTS
+#     replugs are spaced at SHORT_COOLDOWN_S (2 min — aggressive enough
+#     to recover within the same load window, slow enough to let
+#     ftdi_sio fully re-enumerate and the inverter to stabilise between
+#     attempts). After that budget is exhausted we fall back to
+#     LONG_COOLDOWN_S (15 min) on the assumption that if four replugs
+#     in a row haven't held, the adapter is struggling and hammering it
+#     harder won't help — the RS-485 command keeps going out at full
+#     demand anyway so the moment any glitch clears the inverter picks
+#     up.
 #   HEALTHY_RESET_S — if we've stayed not-wedged for this long, reset the
 #     consecutive-attempts counter. Means a legitimate intermittent issue
 #     a week later gets the aggressive short-cooldown treatment again,
@@ -102,9 +105,9 @@ FALLBACK_BATTERY_VOLTAGE = 52.0
 # so the inverter picks up immediately whenever its own condition clears,
 # even without a successful replug.
 AUTO_RESET_STARTUP_DELAY_S = 30.0
-AUTO_RESET_SHORT_COOLDOWN_S = 300.0     # 5 min
+AUTO_RESET_SHORT_COOLDOWN_S = 120.0     # 2 min
 AUTO_RESET_LONG_COOLDOWN_S = 900.0      # 15 min
-AUTO_RESET_SHORT_ATTEMPTS = 2           # first N attempts at short cooldown
+AUTO_RESET_SHORT_ATTEMPTS = 4           # first N attempts at short cooldown
 AUTO_RESET_HEALTHY_RESET_S = 120.0      # 2 min of healthy ops resets the counter
 AUTO_RESET_COMMAND_THRESHOLD_W = 100
 # Widened from 50 W to 200 W once real readings landed: the BMS (CAN) and
