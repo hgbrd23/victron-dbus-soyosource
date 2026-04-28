@@ -277,6 +277,34 @@ marks the transition. No persistent state, no restart required.
 Orthogonal DRIFT detector (grid-based) stays in place as a secondary signal —
 useful when there's no battery monitor on the system.
 
+**Ramp-up settling window.** A sudden grid load spike (kettle, oven, EV
+charger plugging in) can drive `excess_import` sharply positive, the
+controller jumps `last_demand` 200+ W in a single update tick, and
+`_inverter_appears_wedged()` runs against the new commanded demand within
+~10 ms — well before the new frame is even on the wire (`_tx_tick` is on a
+separate 0.5 s schedule), let alone before the inverter has physically
+ramped its DC draw. The Soyosource needs ~3–5 s to ramp to a new level;
+the BMS (CAN) and MPPT (VE.Direct) then need another ~1 s to publish the
+updated readings. During that gap, `expected_bp = solar − commanded_dc/η`
+is computed from the *new* demand, but `bp` still reflects the *old*
+demand level — so the residual is huge (200–300 W) and the wedge fires
+spuriously, kicking off an unnecessary USB replug. The replug churns the
+serial port mid-ramp, and recovery comes from the inverter catching up on
+its own ~5 s later, not from the replug.
+
+The bias is worse at high SoC: cell internal resistance climbs near full,
+voltage sags under load, the Soyosource throttles to avoid UVP, and the
+ramp takes longer — so users see this fire most often when the battery is
+"full". (Originally surfaced as exactly that report.)
+
+Mitigation: when `|new_demand − last_demand| > WEDGE_RAMP_THRESHOLD_W`
+(100 W) in a single tick, stamp `_wedge_settling_until = now +
+WEDGE_SETTLING_S` (5 s). `_inverter_appears_wedged()` returns `False`
+while `time.time() < _wedge_settling_until`. Real wedges still get caught
+— they don't clear in 5 s, so the next tick after the window fires the
+warning normally. The grid-based DRIFT detector stays active throughout
+as a secondary signal for steady-state failures.
+
 ### Gotchas hit during development
 
 - **VenusOS serial scanners must be told we own the port — via `lock_tty`.**

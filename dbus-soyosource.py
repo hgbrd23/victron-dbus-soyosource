@@ -119,6 +119,36 @@ AUTO_RESET_COMMAND_THRESHOLD_W = 100
 # residuals ≥ commanded_ac, typically 400+ W) while not flapping on noise.
 AUTO_RESET_DISCHARGE_THRESHOLD_W = 200
 
+# Wedge-detection settling window after a large single-tick demand jump.
+#
+# The Soyosource takes ~3–5 s to physically ramp its DC draw to a new
+# commanded level; the BMS (CAN) and MPPT (VE.Direct) then take another ~1 s
+# to publish the updated battery/solar readings on D-Bus. During this gap
+# our heuristic compares the *new* commanded demand against battery_power
+# that still reflects the *old* demand level, which routinely produces a
+# 200–300 W mismatch even though the inverter is healthy and catching up.
+#
+# Symptom in the wild: a sudden grid load spike (kettle, oven) drives
+# excess_import sharply positive, the controller commands a 200+ W demand
+# jump in a single tick, _inverter_appears_wedged fires within 9 ms of the
+# update — well before the new demand is even on the wire — and triggers
+# an unnecessary USB replug. The replug churns the serial port mid-ramp
+# but the actual recovery comes from the inverter catching up on its own
+# 4–6 s later.
+#
+# The bias is worse at high SoC: cell internal resistance rises near full,
+# voltage sags under load, and the Soyosource throttles to avoid UVP — so
+# the ramp takes longer and the mismatch is larger. Originally surfaced as
+# a "wedge fires when battery is full" report.
+#
+# Fix: after any single-tick demand change above WEDGE_RAMP_THRESHOLD_W,
+# suppress wedge detection (and therefore the auto-replug) for
+# WEDGE_SETTLING_S seconds. Real wedges still get caught — they don't clear
+# in 5 s, so the next tick after the window fires the warning normally.
+# The drift detector stays active throughout as a secondary signal.
+WEDGE_SETTLING_S = 5.0
+WEDGE_RAMP_THRESHOLD_W = 100
+
 
 def _mode_name(mode):
     return _MODE_NAMES.get(mode, 'Mode(%d)' % mode)
@@ -1048,6 +1078,12 @@ class SoyosourceService:
         self._was_wedged = False
         self._battery_dropout_logged = False
 
+        # Wall-clock until which wedge detection is suppressed because of a
+        # recent single-tick demand jump. See WEDGE_SETTLING_S — gives the
+        # inverter time to physically ramp before we compare battery_power
+        # against the new commanded demand.
+        self._wedge_settling_until = 0.0
+
         # Diagnostics: 60s heartbeat + drift detector. Demand-change logs don't
         # show the steady-state wedge pattern (frame count, grid convergence),
         # so we emit a compact status line every minute and a WARNING when
@@ -1190,9 +1226,10 @@ class SoyosourceService:
              doesn't even TX).
           2. Commanded demand ≥ AUTO_RESET_COMMAND_THRESHOLD_W (below this,
              battery-monitor noise drowns the signal).
-          3. /Dc/Battery/Power is reachable OR was reachable before and
+          3. We're past the post-ramp settling window (see WEDGE_SETTLING_S).
+          4. /Dc/Battery/Power is reachable OR was reachable before and
              we have a recent verdict to stick with.
-          4. Observed battery power is at least AUTO_RESET_DISCHARGE_THRESHOLD_W
+          5. Observed battery power is at least AUTO_RESET_DISCHARGE_THRESHOLD_W
              *higher* than expected (i.e. battery is charging more than it
              should be, because our commanded DC draw isn't showing up).
 
@@ -1224,6 +1261,10 @@ class SoyosourceService:
         if self.mode != MODE_ON:
             return False
         if self.last_demand < AUTO_RESET_COMMAND_THRESHOLD_W:
+            return False
+        # Demand just jumped; battery_power hasn't caught up yet. See
+        # WEDGE_SETTLING_S — false-positive avoidance for the ramp-up window.
+        if time.time() < self._wedge_settling_until:
             return False
 
         bp = self._read_battery_power()
@@ -1365,11 +1406,25 @@ class SoyosourceService:
             else:
                 new_demand = self.last_demand
 
+        demand_change = new_demand - self.last_demand
         if new_demand != self.last_demand:
             grid_str = '%.1fW' % grid if grid is not None else 'n/a'
             log.info("mode=%s grid=%s demand %d -> %d",
                      _mode_name(self.mode), grid_str, self.last_demand, new_demand)
         self.last_demand = new_demand
+
+        # On a large single-tick demand jump, defer the wedge check so the
+        # inverter has time to physically ramp and the BMS / MPPT have time to
+        # publish their new readings. Without this, a sudden grid spike (load
+        # turning on) makes the controller jump the command 200+ W in one
+        # tick, and _inverter_appears_wedged compares the new commanded value
+        # against a battery_power reading still reflecting the old level — a
+        # guaranteed false positive that triggers an unnecessary USB replug.
+        if abs(demand_change) > WEDGE_RAMP_THRESHOLD_W:
+            self._wedge_settling_until = now + WEDGE_SETTLING_S
+            log.info("Demand jumped %+dW in one tick; suppressing wedge "
+                     "detection for %.0fs (inverter ramp + BMS read settling)",
+                     demand_change, WEDGE_SETTLING_S)
 
         # Decide what we *believe* is actually reaching the grid. We keep
         # commanding last_demand on RS-485 (the inverter picks up instantly
